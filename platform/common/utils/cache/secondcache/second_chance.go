@@ -9,6 +9,8 @@ package secondcache
 import (
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // This package implements Second-Chance Algorithm, an approximate LRU algorithms.
@@ -31,6 +33,12 @@ type typedSecondChanceCache[T any] struct {
 
 	// read lock for Get, and write lock for Add
 	rwlock sync.RWMutex
+
+	// dedupes concurrent loader calls in GetOrLoad. Different keys run in
+	// parallel; identical keys share a single loader invocation. Without
+	// this, all loaders serialize through rwlock.Lock and the slow path
+	// becomes a thundering herd under cold-cache load.
+	sfgroup singleflight.Group
 }
 
 type cacheItem[T any] struct {
@@ -76,29 +84,42 @@ func (cache *typedSecondChanceCache[T]) get(key string) (T, bool) {
 }
 
 func (cache *typedSecondChanceCache[T]) GetOrLoad(key string, loader func() (T, error)) (T, bool, error) {
+	// Fast path: many goroutines can read concurrently under RLock.
 	cache.rwlock.RLock()
-
 	if value, ok := cache.get(key); ok {
 		cache.rwlock.RUnlock()
 		return value, true, nil
 	}
 	cache.rwlock.RUnlock()
 
-	cache.rwlock.Lock()
-	defer cache.rwlock.Unlock()
+	// Slow path: dedupe concurrent loads of the same key, and run the
+	// loader OUTSIDE rwlock so different keys are no longer serialized.
+	v, err, _ := cache.sfgroup.Do(key, func() (any, error) {
+		// Recheck: another caller may have populated the entry between
+		// our RUnlock and arrival here.
+		cache.rwlock.RLock()
+		if value, ok := cache.get(key); ok {
+			cache.rwlock.RUnlock()
+			return value, nil
+		}
+		cache.rwlock.RUnlock()
 
-	if value, ok := cache.get(key); ok {
-		return value, true, nil
-	}
+		value, err := loader()
+		if err != nil {
+			return zero[T](), err
+		}
 
-	value, err := loader()
+		// Brief write lock for the in-memory mutation only — no IO.
+		cache.rwlock.Lock()
+		cache.add(key, value)
+		cache.rwlock.Unlock()
+
+		return value, nil
+	})
 	if err != nil {
 		return zero[T](), false, err
 	}
-
-	cache.add(key, value)
-
-	return value, false, nil
+	return v.(T), false, nil
 }
 
 func (cache *typedSecondChanceCache[T]) Add(key string, value T) {
