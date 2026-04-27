@@ -77,27 +77,35 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 
 		var lock sync.Mutex
 
+		// Bound this iteration with a cancelable context so we can stop the
+		// in-flight Recv() calls on the remaining N - threshold orderers as
+		// soon as f+1 acks land. Without this, broadcast latency is capped
+		// by max(orderer RTT), so a single slow orderer pins p99 to its RTT.
+		iterCtx, cancel := context.WithCancel(ctx)
+		thresholdMet := make(chan struct{})
+		var thresholdOnce sync.Once
+
 		for _, orderer := range orderers {
 			go func(orderer *grpc.ConnectionConfig) {
 				defer wg.Done()
 
-				logger.DebugfContext(ctx, "get connection to [%s]", orderer.Address)
-				connection, err := o.getConnection(ctx, orderer)
+				logger.DebugfContext(iterCtx, "get connection to [%s]", orderer.Address)
+				connection, err := o.getConnection(iterCtx, orderer)
 
 				lock.Lock()
 				if err != nil {
 					errs = append(errs, errors.Wrapf(err, "failed connecting to [%v]", orderer.Address))
-					logger.WarnfContext(ctx, "failed to get connection to orderer [%s]", orderer.Address, err)
+					logger.WarnfContext(iterCtx, "failed to get connection to orderer [%s]", orderer.Address, err)
 					lock.Unlock()
 					return
 				}
 
 				lock.Unlock()
 
-				logger.DebugfContext(ctx, "broadcast to [%s]", orderer.Address)
+				logger.DebugfContext(iterCtx, "broadcast to [%s]", orderer.Address)
 				err = connection.Send(env)
 				if err != nil {
-					logger.ErrorfContext(ctx, "failed to broadcast to [%s]: %s", orderer.Address, err.Error())
+					logger.ErrorfContext(iterCtx, "failed to broadcast to [%s]: %s", orderer.Address, err.Error())
 					lock.Lock()
 					defer lock.Unlock()
 					usedConnections = append(usedConnections, connection)
@@ -105,7 +113,7 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 				}
 				status, err := connection.Recv()
 				if err != nil {
-					logger.ErrorfContext(ctx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
+					logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
 					lock.Lock()
 					defer lock.Unlock()
 					usedConnections = append(usedConnections, connection)
@@ -119,28 +127,41 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 				case common2.Status_SUCCESS:
 					o.releaseConnection(connection, orderer)
 					counter++
+					if counter >= threshold {
+						thresholdOnce.Do(func() { close(thresholdMet) })
+					}
 				default:
 					usedConnections = append(usedConnections, connection)
-					logger.ErrorfContext(ctx, "failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(status.GetStatus())])
+					logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(status.GetStatus())])
 					errs = append(errs, fmt.Errorf("failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(status.GetStatus())]))
 					return
 				}
 			}(orderer)
 		}
 
-		wg.Wait()
-
-		// did we send to enough orderers?
-		// if not, discard all connections
-		if counter >= threshold {
-			// success
+		// Wait for either threshold success or all goroutines done.
+		allDone := make(chan struct{})
+		go func() { wg.Wait(); close(allDone) }()
+		select {
+		case <-thresholdMet:
+			// Enough acks; the remaining sub-goroutines run in the
+			// background. Cancel iterCtx so their Recv()/getConnection
+			// unblocks immediately. usedConnections updates from late
+			// arrivals are safe — they hold the lock and we no longer
+			// read the slice in the success path.
+			cancel()
 			return nil
+		case <-allDone:
 		}
+		cancel()
 
 		// fail
 		logger.WarnfContext(ctx, "failed to broadcast, got [%d of %d] success and errs [%v], retry after a delay", counter, threshold, errs)
 		// cleanup connections
-		for _, connection := range usedConnections {
+		lock.Lock()
+		toDiscard := append([]*Connection(nil), usedConnections...)
+		lock.Unlock()
+		for _, connection := range toDiscard {
 			o.discardConnection(connection)
 		}
 	}
