@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	common2 "github.com/hyperledger/fabric-protos-go-apiv2/common"
@@ -23,10 +24,12 @@ import (
 )
 
 // BFTBroadcaster fans broadcast envelopes out to N≥4 orderers and returns as
-// soon as f+1 acks are observed. Connection state is partitioned per orderer
-// so neither connection caching nor connection-creation backpressure
-// serialize through a single mutex when many goroutines call Broadcast
-// concurrently.
+// soon as ceil((N+f+1)/2) successful acks are observed (i.e. 2f+1 in a
+// minimal N=3f+1 deployment, or a majority-of-honest in larger ones), rather
+// than waiting for all N goroutines to finish. Connection state is partitioned
+// per orderer so neither connection caching nor connection-creation
+// backpressure serialize through a single mutex when many goroutines call
+// Broadcast concurrently.
 type BFTBroadcaster struct {
 	ConfigService driver.ConfigService
 	ClientFactory Services
@@ -91,9 +94,10 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 		wg.Add(n)
 
 		// Bound this iteration with a cancelable context so we can stop the
-		// in-flight Recv() calls on the remaining N - threshold orderers as
-		// soon as f+1 acks land. Without this, broadcast latency is capped
-		// by max(orderer RTT), so a single slow orderer pins p99 to its RTT.
+		// in-flight Recv() calls on the remaining N - threshold orderers
+		// once the threshold is met. Without this, broadcast latency is
+		// capped by max(orderer RTT), so a single slow orderer pins p99 to
+		// its RTT even when threshold acks have already landed.
 		iterCtx, cancel := context.WithCancel(ctx)
 		thresholdMet := make(chan struct{})
 		var thresholdOnce sync.Once
@@ -112,34 +116,62 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 					return
 				}
 
+				// Coordinate connection disposition between this worker and
+				// the watcher goroutine below. Whoever wins the CAS owns the
+				// connection: the worker releases on success, every other
+				// path discards. Without this, a fast return at threshold
+				// cancels iterCtx but Send/Recv (neither honours a context)
+				// stay parked on a stuck orderer, holding the connection
+				// and its per-orderer sem slot indefinitely.
+				var disposed atomic.Bool
+				workerDone := make(chan struct{})
+				defer close(workerDone)
+				go func() {
+					select {
+					case <-iterCtx.Done():
+						if disposed.CompareAndSwap(false, true) {
+							o.discardConnection(connection, orderer.Address)
+						}
+					case <-workerDone:
+					}
+				}()
+
 				logger.DebugfContext(iterCtx, "broadcast to [%s]", orderer.Address)
 				if err := connection.Send(env); err != nil {
-					logger.ErrorfContext(iterCtx, "failed to broadcast to [%s]: %s", orderer.Address, err.Error())
-					o.discardConnection(connection, orderer.Address)
+					if disposed.CompareAndSwap(false, true) {
+						logger.ErrorfContext(iterCtx, "failed to broadcast to [%s]: %s", orderer.Address, err.Error())
+						o.discardConnection(connection, orderer.Address)
+					}
 					return
 				}
 				ack, err := connection.Recv()
 				if err != nil {
-					logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
-					o.discardConnection(connection, orderer.Address)
+					if disposed.CompareAndSwap(false, true) {
+						logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
+						o.discardConnection(connection, orderer.Address)
+					}
 					return
 				}
 
 				switch ack.GetStatus() {
 				case common2.Status_SUCCESS:
-					o.releaseConnection(connection, orderer)
-					lock.Lock()
-					counter++
-					if counter >= threshold {
-						thresholdOnce.Do(func() { close(thresholdMet) })
+					if disposed.CompareAndSwap(false, true) {
+						o.releaseConnection(connection, orderer)
+						lock.Lock()
+						counter++
+						if counter >= threshold {
+							thresholdOnce.Do(func() { close(thresholdMet) })
+						}
+						lock.Unlock()
 					}
-					lock.Unlock()
 				default:
-					logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(ack.GetStatus())])
-					o.discardConnection(connection, orderer.Address)
-					lock.Lock()
-					errs = append(errs, fmt.Errorf("failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(ack.GetStatus())]))
-					lock.Unlock()
+					if disposed.CompareAndSwap(false, true) {
+						logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(ack.GetStatus())])
+						o.discardConnection(connection, orderer.Address)
+						lock.Lock()
+						errs = append(errs, fmt.Errorf("failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(ack.GetStatus())]))
+						lock.Unlock()
+					}
 				}
 			}(orderer)
 		}
