@@ -83,6 +83,16 @@ func (cache *typedSecondChanceCache[T]) get(key string) (T, bool) {
 	return item.value, true
 }
 
+// sfResult carries the GetOrLoad return tuple through singleflight so that:
+//   - ok-semantic survives dedup (followers see fromCache reflecting whether
+//     the leader actually ran the loader vs. recheck-hit);
+//   - T=interface{} with a nil loader value does not panic on type assertion
+//     (the struct is always non-nil even if val is a nil interface).
+type sfResult[T any] struct {
+	val       T
+	fromCache bool
+}
+
 func (cache *typedSecondChanceCache[T]) GetOrLoad(key string, loader func() (T, error)) (T, bool, error) {
 	// Fast path: many goroutines can read concurrently under RLock.
 	cache.rwlock.RLock()
@@ -95,31 +105,40 @@ func (cache *typedSecondChanceCache[T]) GetOrLoad(key string, loader func() (T, 
 	// Slow path: dedupe concurrent loads of the same key, and run the
 	// loader OUTSIDE rwlock so different keys are no longer serialized.
 	v, err, _ := cache.sfgroup.Do(key, func() (any, error) {
-		// Recheck: another caller may have populated the entry between
-		// our RUnlock and arrival here.
+		// Recheck under RLock: another caller may have populated the entry
+		// between our RUnlock and arrival here.
 		cache.rwlock.RLock()
 		if value, ok := cache.get(key); ok {
 			cache.rwlock.RUnlock()
-			return value, nil
+			return sfResult[T]{val: value, fromCache: true}, nil
 		}
 		cache.rwlock.RUnlock()
 
 		value, err := loader()
 		if err != nil {
-			return zero[T](), err
+			return sfResult[T]{}, err
 		}
 
-		// Brief write lock for the in-memory mutation only — no IO.
+		// Final recheck under write lock: a concurrent Add() may have raced
+		// with our (unlocked) loader; do not overwrite a fresher value.
 		cache.rwlock.Lock()
+		if existing, ok := cache.get(key); ok {
+			cache.rwlock.Unlock()
+			return sfResult[T]{val: existing, fromCache: true}, nil
+		}
 		cache.add(key, value)
 		cache.rwlock.Unlock()
 
-		return value, nil
+		return sfResult[T]{val: value, fromCache: false}, nil
 	})
 	if err != nil {
 		return zero[T](), false, err
 	}
-	return v.(T), false, nil
+	// Two-value type assertion guards against panics in pathological cases
+	// (e.g., singleflight returning a nil any); on success r is the wrapped
+	// result and ok is true, so r.val is the correct T (possibly nil).
+	r, _ := v.(sfResult[T])
+	return r.val, r.fromCache, nil
 }
 
 func (cache *typedSecondChanceCache[T]) Add(key string, value T) {
