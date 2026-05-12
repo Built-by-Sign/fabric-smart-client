@@ -91,6 +91,29 @@ func TestClientProvider_NotificationServiceClient(t *testing.T) {
 		require.Nil(t, cc)
 		require.Contains(t, err.Error(), "we need a single endpoint")
 	})
+
+	t.Run("caches per network", func(t *testing.T) {
+		t.Parallel()
+		fakeConfigProvider := &mock.ServiceConfigProvider{}
+		fakeConfigProvider.NotificationServiceConfigStub = func(network string) (*config.Config, error) {
+			return &config.Config{
+				Endpoints: []config.Endpoint{{Address: "localhost:1234"}},
+			}, nil
+		}
+
+		cp := grpc2.NewClientProvider(fakeConfigProvider)
+		cc1, err := cp.NotificationServiceClient("net-a")
+		require.NoError(t, err)
+		cc2, err := cp.NotificationServiceClient("net-a")
+		require.NoError(t, err)
+		require.Same(t, cc1, cc2)
+		require.Equal(t, 1, fakeConfigProvider.NotificationServiceConfigCallCount())
+
+		cc3, err := cp.NotificationServiceClient("net-b")
+		require.NoError(t, err)
+		require.NotSame(t, cc1, cc3)
+		require.Equal(t, 2, fakeConfigProvider.NotificationServiceConfigCallCount())
+	})
 }
 
 func TestClientProvider_QueryServiceClient(t *testing.T) {
@@ -137,6 +160,53 @@ func TestClientProvider_QueryServiceClient(t *testing.T) {
 		require.Error(t, err)
 		require.Nil(t, cc)
 		require.Contains(t, err.Error(), "we need a single endpoint")
+	})
+
+	t.Run("caches per network", func(t *testing.T) {
+		t.Parallel()
+		fakeConfigProvider := &mock.ServiceConfigProvider{}
+		fakeConfigProvider.QueryServiceConfigStub = func(network string) (*config.Config, error) {
+			return &config.Config{
+				Endpoints: []config.Endpoint{{Address: "localhost:5678"}},
+			}, nil
+		}
+
+		cp := grpc2.NewClientProvider(fakeConfigProvider)
+		cc1, err := cp.QueryServiceClient("net-a")
+		require.NoError(t, err)
+		cc2, err := cp.QueryServiceClient("net-a")
+		require.NoError(t, err)
+		require.Same(t, cc1, cc2)
+		require.Equal(t, 1, fakeConfigProvider.QueryServiceConfigCallCount())
+
+		cc3, err := cp.QueryServiceClient("net-b")
+		require.NoError(t, err)
+		require.NotSame(t, cc1, cc3)
+		require.Equal(t, 2, fakeConfigProvider.QueryServiceConfigCallCount())
+	})
+
+	t.Run("notification and query caches are independent", func(t *testing.T) {
+		t.Parallel()
+		fakeConfigProvider := &mock.ServiceConfigProvider{}
+		fakeConfigProvider.NotificationServiceConfigStub = func(network string) (*config.Config, error) {
+			return &config.Config{
+				Endpoints: []config.Endpoint{{Address: "localhost:1111"}},
+			}, nil
+		}
+		fakeConfigProvider.QueryServiceConfigStub = func(network string) (*config.Config, error) {
+			return &config.Config{
+				Endpoints: []config.Endpoint{{Address: "localhost:2222"}},
+			}, nil
+		}
+
+		cp := grpc2.NewClientProvider(fakeConfigProvider)
+		notif, err := cp.NotificationServiceClient("net-a")
+		require.NoError(t, err)
+		query, err := cp.QueryServiceClient("net-a")
+		require.NoError(t, err)
+		require.NotSame(t, notif, query)
+		require.Equal(t, "localhost:1111", notif.Target())
+		require.Equal(t, "localhost:2222", query.Target())
 	})
 }
 
