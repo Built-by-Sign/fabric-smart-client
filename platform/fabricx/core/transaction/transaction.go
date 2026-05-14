@@ -549,7 +549,7 @@ func (t *Transaction) generateProposal(signer SerializableSigner) error {
 	t.TProposal = proposal
 	t.TSignedProposal, err = protoutil.GetSignedProposal(proposal, signer)
 	if err != nil {
-		return errors.Errorf("error creating underlying signed proposal for %s", funcName)
+		return errors.Wrapf(err, "error creating underlying signed proposal for %s", funcName)
 	}
 
 	t.signedProposal, err = newSignedProposal(t.TSignedProposal)

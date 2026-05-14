@@ -221,7 +221,7 @@ func (n *notificationListenerManager) AddFinalityListener(txID driver.TxID, list
 			TxIds: txIDs,
 		},
 		// TODO: set a proper timeout
-		Timeout: durationpb.New(10 * time.Second),
+		Timeout: durationpb.New(60 * time.Second),
 	}
 
 	return nil

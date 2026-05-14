@@ -9,6 +9,8 @@ package secondcache
 import (
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // This package implements Second-Chance Algorithm, an approximate LRU algorithms.
@@ -31,6 +33,12 @@ type typedSecondChanceCache[T any] struct {
 
 	// read lock for Get, and write lock for Add
 	rwlock sync.RWMutex
+
+	// dedupes concurrent loader calls in GetOrLoad. Different keys run in
+	// parallel; identical keys share a single loader invocation. Without
+	// this, all loaders serialize through rwlock.Lock and the slow path
+	// becomes a thundering herd under cold-cache load.
+	sfgroup singleflight.Group
 }
 
 type cacheItem[T any] struct {
@@ -75,30 +83,62 @@ func (cache *typedSecondChanceCache[T]) get(key string) (T, bool) {
 	return item.value, true
 }
 
-func (cache *typedSecondChanceCache[T]) GetOrLoad(key string, loader func() (T, error)) (T, bool, error) {
-	cache.rwlock.RLock()
+// sfResult carries the GetOrLoad return tuple through singleflight so that:
+//   - ok-semantic survives dedup (followers see fromCache reflecting whether
+//     the leader actually ran the loader vs. recheck-hit);
+//   - T=interface{} with a nil loader value does not panic on type assertion
+//     (the struct is always non-nil even if val is a nil interface).
+type sfResult[T any] struct {
+	val       T
+	fromCache bool
+}
 
+func (cache *typedSecondChanceCache[T]) GetOrLoad(key string, loader func() (T, error)) (T, bool, error) {
+	// Fast path: many goroutines can read concurrently under RLock.
+	cache.rwlock.RLock()
 	if value, ok := cache.get(key); ok {
 		cache.rwlock.RUnlock()
 		return value, true, nil
 	}
 	cache.rwlock.RUnlock()
 
-	cache.rwlock.Lock()
-	defer cache.rwlock.Unlock()
+	// Slow path: dedupe concurrent loads of the same key, and run the
+	// loader OUTSIDE rwlock so different keys are no longer serialized.
+	v, err, _ := cache.sfgroup.Do(key, func() (any, error) {
+		// Recheck under RLock: another caller may have populated the entry
+		// between our RUnlock and arrival here.
+		cache.rwlock.RLock()
+		if value, ok := cache.get(key); ok {
+			cache.rwlock.RUnlock()
+			return sfResult[T]{val: value, fromCache: true}, nil
+		}
+		cache.rwlock.RUnlock()
 
-	if value, ok := cache.get(key); ok {
-		return value, true, nil
-	}
+		value, err := loader()
+		if err != nil {
+			return sfResult[T]{}, err
+		}
 
-	value, err := loader()
+		// Final recheck under write lock: a concurrent Add() may have raced
+		// with our (unlocked) loader; do not overwrite a fresher value.
+		cache.rwlock.Lock()
+		if existing, ok := cache.get(key); ok {
+			cache.rwlock.Unlock()
+			return sfResult[T]{val: existing, fromCache: true}, nil
+		}
+		cache.add(key, value)
+		cache.rwlock.Unlock()
+
+		return sfResult[T]{val: value, fromCache: false}, nil
+	})
 	if err != nil {
 		return zero[T](), false, err
 	}
-
-	cache.add(key, value)
-
-	return value, false, nil
+	// Two-value type assertion guards against panics in pathological cases
+	// (e.g., singleflight returning a nil any); on success r is the wrapped
+	// result and ok is true, so r.val is the correct T (possibly nil).
+	r, _ := v.(sfResult[T])
+	return r.val, r.fromCache, nil
 }
 
 func (cache *typedSecondChanceCache[T]) Add(key string, value T) {
