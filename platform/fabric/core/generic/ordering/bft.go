@@ -27,7 +27,13 @@ type BFTBroadcaster struct {
 	ConfigService driver.ConfigService
 	ClientFactory Services
 
-	connSem  *semaphore.Weighted
+	// connSems holds one Weighted semaphore per orderer address. Replaces
+	// upstream's single global connSem — with one global sem all permits
+	// can be drained by a single slow orderer, starving the others under
+	// high concurrency. See obsidian "CBDC 压测优化迭代 2026-05-15" §4.5.
+	connSemsLock sync.Mutex
+	connSems     map[string]*semaphore.Weighted
+
 	metrics  *metrics.Metrics
 	poolSize int
 
@@ -40,10 +46,23 @@ func NewBFTBroadcaster(configService driver.ConfigService, cf Services, metrics 
 		ConfigService: configService,
 		ClientFactory: cf,
 		connections:   map[string]chan *Connection{},
-		connSem:       semaphore.NewWeighted(int64(configService.OrdererConnectionPoolSize())),
+		connSems:      map[string]*semaphore.Weighted{},
 		metrics:       metrics,
 		poolSize:      configService.OrdererConnectionPoolSize(),
 	}
+}
+
+// connSem returns the per-orderer semaphore for addr, lazily creating it
+// on first request. Matches the pattern of connectionPool.
+func (o *BFTBroadcaster) connSem(addr string) *semaphore.Weighted {
+	o.connSemsLock.Lock()
+	defer o.connSemsLock.Unlock()
+	if s, ok := o.connSems[addr]; ok {
+		return s
+	}
+	s := semaphore.NewWeighted(int64(o.poolSize))
+	o.connSems[addr] = s
+	return s
 }
 
 func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) error {
@@ -156,10 +175,11 @@ func (o *BFTBroadcaster) getConnection(ctx context.Context, to *grpc.ConnectionC
 			// if there is a connection available, return it
 			return connection, nil
 		default:
-			// Try to acquire the right to create a new connection.
-			// If this fails, retry with an existing connection
+			// Try to acquire the right to create a new connection — per
+			// orderer, not globally. With one global sem a single slow
+			// orderer can drain every permit and starve the others.
 			semContext, cancel := context.WithTimeout(ctx, 1*time.Second)
-			if err := o.connSem.Acquire(semContext, 1); err != nil {
+			if err := o.connSem(to.Address).Acquire(semContext, 1); err != nil {
 				cancel()
 				break
 			}
@@ -168,11 +188,13 @@ func (o *BFTBroadcaster) getConnection(ctx context.Context, to *grpc.ConnectionC
 			// create connection
 			client, err := o.ClientFactory.NewOrdererClient(*to)
 			if err != nil {
+				o.connSem(to.Address).Release(1)
 				return nil, errors.Wrapf(err, "failed creating orderer client for %s", to.Address)
 			}
 
 			oClient, err := client.OrdererClient()
 			if err != nil {
+				o.connSem(to.Address).Release(1)
 				rpcStatus, _ := status.FromError(err)
 				return nil, errors.Wrapf(err, "failed to new a broadcast, rpcStatus=%+v", rpcStatus)
 			}
@@ -181,13 +203,15 @@ func (o *BFTBroadcaster) getConnection(ctx context.Context, to *grpc.ConnectionC
 			// Notice that this stream is shared, therefore its context must be something different from the context of the current broadcast request
 			stream, err := oClient.Broadcast(context.Background())
 			if err != nil {
+				o.connSem(to.Address).Release(1)
 				client.Close()
 				return nil, errors.Wrapf(err, "failed creating orderer stream for %s", to.Address)
 			}
 
 			return &Connection{
-				Stream: stream,
-				Client: client,
+				Address: to.Address,
+				Stream:  stream,
+				Client:  client,
 			}, nil
 		}
 	}
@@ -195,7 +219,13 @@ func (o *BFTBroadcaster) getConnection(ctx context.Context, to *grpc.ConnectionC
 
 func (o *BFTBroadcaster) discardConnection(connection *Connection) {
 	if connection != nil {
-		o.connSem.Release(1)
+		// Release the per-orderer semaphore that getConnection acquired
+		// when this connection was created. connection.Address was set
+		// at creation time; falling back to a no-op release if empty
+		// would leak permits on the wrong sem.
+		if connection.Address != "" {
+			o.connSem(connection.Address).Release(1)
+		}
 		if connection.Stream != nil {
 			if err := connection.Stream.CloseSend(); err != nil {
 				logger.Warnf("failed to close connection to ordering [%s]", err)

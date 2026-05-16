@@ -17,9 +17,13 @@ import (
 )
 
 type Connection struct {
-	lock   sync.Mutex
-	Stream Broadcast
-	Client Client
+	lock sync.Mutex
+	// Address is the orderer this connection was created for. Used by
+	// BFTBroadcaster.discardConnection to release the right per-orderer
+	// semaphore (see obsidian "CBDC 压测优化迭代 2026-05-15" §4.5).
+	Address string
+	Stream  Broadcast
+	Client  Client
 }
 
 func (c *Connection) Send(m *common.Envelope) error {
