@@ -14,7 +14,6 @@ import (
 	"time"
 
 	common2 "github.com/hyperledger/fabric-protos-go-apiv2/common"
-	"golang.org/x/sync/semaphore"
 	"google.golang.org/grpc/status"
 
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
@@ -23,46 +22,66 @@ import (
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/grpc"
 )
 
+const (
+	defaultBFTConnectionPoolSize = 10
+	bftSendRecvTimeout           = 10 * time.Second
+)
+
+type bftOrdererState struct {
+	pool  chan *Connection
+	slots chan struct{}
+}
+
 type BFTBroadcaster struct {
 	ConfigService driver.ConfigService
 	ClientFactory Services
 
-	// connSems holds one Weighted semaphore per orderer address. Replaces
-	// upstream's single global connSem — with one global sem all permits
-	// can be drained by a single slow orderer, starving the others under
-	// high concurrency. See obsidian "CBDC 压测优化迭代 2026-05-15" §4.5.
-	connSemsLock sync.Mutex
-	connSems     map[string]*semaphore.Weighted
+	statesLock sync.RWMutex
+	states     map[string]*bftOrdererState
 
 	metrics  *metrics.Metrics
 	poolSize int
-
-	connectionsLock sync.RWMutex
-	connections     map[string]chan *Connection
 }
 
 func NewBFTBroadcaster(configService driver.ConfigService, cf Services, metrics *metrics.Metrics) *BFTBroadcaster {
+	poolSize := configService.OrdererConnectionPoolSize()
+	if poolSize <= 0 {
+		logger.Warnf("invalid BFT orderer connection pool size [%d], falling back to [%d]", poolSize, defaultBFTConnectionPoolSize)
+		poolSize = defaultBFTConnectionPoolSize
+	}
 	return &BFTBroadcaster{
 		ConfigService: configService,
 		ClientFactory: cf,
-		connections:   map[string]chan *Connection{},
-		connSems:      map[string]*semaphore.Weighted{},
+		states:        map[string]*bftOrdererState{},
 		metrics:       metrics,
-		poolSize:      configService.OrdererConnectionPoolSize(),
+		poolSize:      poolSize,
 	}
 }
 
-// connSem returns the per-orderer semaphore for addr, lazily creating it
-// on first request. Matches the pattern of connectionPool.
-func (o *BFTBroadcaster) connSem(addr string) *semaphore.Weighted {
-	o.connSemsLock.Lock()
-	defer o.connSemsLock.Unlock()
-	if s, ok := o.connSems[addr]; ok {
-		return s
+func (o *BFTBroadcaster) ordererState(addr string) *bftOrdererState {
+	o.statesLock.RLock()
+	state, ok := o.states[addr]
+	o.statesLock.RUnlock()
+	if ok {
+		return state
 	}
-	s := semaphore.NewWeighted(int64(o.poolSize))
-	o.connSems[addr] = s
-	return s
+
+	o.statesLock.Lock()
+	defer o.statesLock.Unlock()
+	if state, ok = o.states[addr]; ok {
+		return state
+	}
+
+	slots := make(chan struct{}, o.poolSize)
+	for i := 0; i < o.poolSize; i++ {
+		slots <- struct{}{}
+	}
+	state = &bftOrdererState{
+		pool:  make(chan *Connection, o.poolSize),
+		slots: slots,
+	}
+	o.states[addr] = state
+	return state
 }
 
 func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) error {
@@ -114,20 +133,15 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 				lock.Unlock()
 
 				logger.DebugfContext(ctx, "broadcast to [%s]", orderer.Address)
-				err = connection.Send(env)
-				if err != nil {
-					logger.ErrorfContext(ctx, "failed to broadcast to [%s]: %s", orderer.Address, err.Error())
-					lock.Lock()
-					defer lock.Unlock()
-					usedConnections = append(usedConnections, connection)
-					return
-				}
-				status, err := connection.Recv()
+				sendRecvCtx, cancel := context.WithTimeout(ctx, bftSendRecvTimeout)
+				status, err := connection.SendAndRecv(sendRecvCtx, env)
+				cancel()
 				if err != nil {
 					logger.ErrorfContext(ctx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
 					lock.Lock()
 					defer lock.Unlock()
 					usedConnections = append(usedConnections, connection)
+					errs = append(errs, errors.Wrapf(err, "failed broadcasting to [%v]", orderer.Address))
 					return
 				}
 
@@ -168,79 +182,94 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 }
 
 func (o *BFTBroadcaster) getConnection(ctx context.Context, to *grpc.ConnectionConfig) (*Connection, error) {
-	pool := o.connectionPool(to.Address)
-	for {
-		select {
-		case connection := <-pool:
-			// if there is a connection available, return it
-			return connection, nil
-		default:
-			// Try to acquire the right to create a new connection — per
-			// orderer, not globally. With one global sem a single slow
-			// orderer can drain every permit and starve the others.
-			semContext, cancel := context.WithTimeout(ctx, 1*time.Second)
-			if err := o.connSem(to.Address).Acquire(semContext, 1); err != nil {
-				cancel()
-				break
-			}
-			cancel()
+	state := o.ordererState(to.Address)
 
-			// create connection
-			client, err := o.ClientFactory.NewOrdererClient(*to)
-			if err != nil {
-				o.connSem(to.Address).Release(1)
-				return nil, errors.Wrapf(err, "failed creating orderer client for %s", to.Address)
-			}
-
-			oClient, err := client.OrdererClient()
-			if err != nil {
-				o.connSem(to.Address).Release(1)
-				rpcStatus, _ := status.FromError(err)
-				return nil, errors.Wrapf(err, "failed to new a broadcast, rpcStatus=%+v", rpcStatus)
-			}
-
-			// Get the broadcast stream to receive a reply of Acknowledgement for each common.Envelope in order, indicating success or type of failure.
-			// Notice that this stream is shared, therefore its context must be something different from the context of the current broadcast request
-			stream, err := oClient.Broadcast(context.Background())
-			if err != nil {
-				o.connSem(to.Address).Release(1)
-				client.Close()
-				return nil, errors.Wrapf(err, "failed creating orderer stream for %s", to.Address)
-			}
-
-			return &Connection{
-				Address: to.Address,
-				Stream:  stream,
-				Client:  client,
-			}, nil
-		}
+	select {
+	case connection := <-state.pool:
+		return connection, nil
+	default:
 	}
+
+	select {
+	case <-state.slots:
+		return o.createConnectionWithSlot(to, state)
+	default:
+	}
+
+	select {
+	case connection := <-state.pool:
+		return connection, nil
+	case <-state.slots:
+		return o.createConnectionWithSlot(to, state)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (o *BFTBroadcaster) createConnectionWithSlot(to *grpc.ConnectionConfig, state *bftOrdererState) (*Connection, error) {
+	connection, err := o.createConnection(to)
+	if err != nil {
+		o.releaseSlot(state)
+		return nil, err
+	}
+	return connection, nil
+}
+
+func (o *BFTBroadcaster) createConnection(to *grpc.ConnectionConfig) (*Connection, error) {
+	client, err := o.ClientFactory.NewOrdererClient(*to)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed creating orderer client for %s", to.Address)
+	}
+
+	oClient, err := client.OrdererClient()
+	if err != nil {
+		client.Close()
+		rpcStatus, _ := status.FromError(err)
+		return nil, errors.Wrapf(err, "failed to new a broadcast, rpcStatus=%+v", rpcStatus)
+	}
+
+	// The broadcast stream is shared by pooled sends, so it uses a connection-scoped
+	// context instead of the current request context. SendAndRecv cancels this
+	// context when a request times out so a blocked Recv cannot wedge the process.
+	streamCtx, cancel := context.WithCancel(context.Background())
+	stream, err := oClient.Broadcast(streamCtx)
+	if err != nil {
+		cancel()
+		client.Close()
+		return nil, errors.Wrapf(err, "failed creating orderer stream for %s", to.Address)
+	}
+
+	return &Connection{
+		Address: to.Address,
+		Stream:  stream,
+		Client:  client,
+		Cancel:  cancel,
+	}, nil
 }
 
 func (o *BFTBroadcaster) discardConnection(connection *Connection) {
 	if connection != nil {
-		// Release the per-orderer semaphore that getConnection acquired
-		// when this connection was created. connection.Address was set
-		// at creation time; falling back to a no-op release if empty
-		// would leak permits on the wrong sem.
-		if connection.Address != "" {
-			o.connSem(connection.Address).Release(1)
-		}
 		if connection.Stream != nil {
 			if err := connection.Stream.CloseSend(); err != nil {
 				logger.Warnf("failed to close connection to ordering [%s]", err)
 			}
 		}
+		if connection.Cancel != nil {
+			connection.Cancel()
+		}
 		if connection.Client != nil {
 			connection.Client.Close()
+		}
+		if connection.Address != "" {
+			o.releaseSlot(o.ordererState(connection.Address))
 		}
 	}
 }
 
 func (o *BFTBroadcaster) releaseConnection(connection *Connection, to *grpc.ConnectionConfig) {
-	pool := o.connectionPool(to.Address)
+	state := o.ordererState(to.Address)
 	select {
-	case pool <- connection:
+	case state.pool <- connection:
 		return
 	default:
 		// if there is not enough space in the channel, then discard the connection
@@ -248,19 +277,10 @@ func (o *BFTBroadcaster) releaseConnection(connection *Connection, to *grpc.Conn
 	}
 }
 
-func (o *BFTBroadcaster) connectionPool(id string) chan *Connection {
-	o.connectionsLock.RLock()
-	connections, ok := o.connections[id]
-	o.connectionsLock.RUnlock()
-	if !ok {
-		o.connectionsLock.Lock()
-		connections, ok = o.connections[id]
-		if !ok {
-			connections = make(chan *Connection, o.poolSize)
-			o.connections[id] = connections
-		}
-		o.connectionsLock.Unlock()
+func (o *BFTBroadcaster) releaseSlot(state *bftOrdererState) {
+	select {
+	case state.slots <- struct{}{}:
+	default:
+		logger.Warnf("failed to release BFT orderer connection slot: slot channel is full")
 	}
-
-	return connections
 }
