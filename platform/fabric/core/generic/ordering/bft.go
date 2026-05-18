@@ -87,12 +87,19 @@ func (o *BFTBroadcaster) ordererState(addr string) *bftOrdererState {
 func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) error {
 	logger.DebugfContext(ctx, "Start BFT Broadcast")
 	defer logger.DebugfContext(ctx, "End BFT Broadcast")
+	ensureBFTMetricsInit()
+	broadcastStart := time.Now()
+	var broadcastErr error
+	defer func() {
+		recordBFTPhase(ctx, bftBroadcast, time.Since(broadcastStart), broadcastErr, "")
+	}()
 	// send the envelope for ordering
 	retries := o.ConfigService.BroadcastNumRetries()
 	retryInterval := o.ConfigService.BroadcastRetryInterval()
 	orderers := o.ConfigService.Orderers()
 	if len(orderers) < 4 {
-		return errors.Errorf("not enough orderers, 4 minimum got [%d]", len(orderers))
+		broadcastErr = errors.Errorf("not enough orderers, 4 minimum got [%d]", len(orderers))
+		return broadcastErr
 	}
 
 	n := len(orderers)
@@ -120,7 +127,9 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 				defer wg.Done()
 
 				logger.DebugfContext(ctx, "get connection to [%s]", orderer.Address)
+				getConnStart := time.Now()
 				connection, err := o.getConnection(ctx, orderer)
+				recordBFTPhase(ctx, bftGetConn, time.Since(getConnStart), err, orderer.Address)
 
 				lock.Lock()
 				if err != nil {
@@ -134,7 +143,9 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 
 				logger.DebugfContext(ctx, "broadcast to [%s]", orderer.Address)
 				sendRecvCtx, cancel := context.WithTimeout(ctx, bftSendRecvTimeout)
+				sendRecvStart := time.Now()
 				status, err := connection.SendAndRecv(sendRecvCtx, env)
+				recordBFTPhase(ctx, bftSendRecv, time.Since(sendRecvStart), err, orderer.Address)
 				cancel()
 				if err != nil {
 					logger.ErrorfContext(ctx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
@@ -178,7 +189,8 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 		}
 	}
 
-	return errors.Errorf("failed to send transaction to the orderering service")
+	broadcastErr = errors.Errorf("failed to send transaction to the orderering service")
+	return broadcastErr
 }
 
 func (o *BFTBroadcaster) getConnection(ctx context.Context, to *grpc.ConnectionConfig) (*Connection, error) {

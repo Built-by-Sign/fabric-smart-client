@@ -9,6 +9,7 @@ package ordering
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/hyperledger/fabric-protos-go-apiv2/common"
 	ab "github.com/hyperledger/fabric-protos-go-apiv2/orderer"
@@ -49,6 +50,13 @@ func (c *Connection) SendAndRecv(ctx context.Context, m *common.Envelope) (*ab.B
 		return nil, err
 	}
 
+	// recv_only measures the wait from "Send returned" to "Recv resolved"
+	// (or ctx cancellation). This separates orderer ack latency from local
+	// gRPC Send cost; bft_send_recv covers both and is recorded by the
+	// caller in bft.go.
+	ensureBFTMetricsInit()
+	recvStart := time.Now()
+
 	type recvResult struct {
 		resp *ab.BroadcastResponse
 		err  error
@@ -61,8 +69,10 @@ func (c *Connection) SendAndRecv(ctx context.Context, m *common.Envelope) (*ab.B
 
 	select {
 	case res := <-done:
+		recordBFTPhase(ctx, bftRecvOnly, time.Since(recvStart), res.err, c.Address)
 		return res.resp, res.err
 	case <-ctx.Done():
+		recordBFTPhase(ctx, bftRecvOnly, time.Since(recvStart), ctx.Err(), c.Address)
 		if c.Cancel != nil {
 			c.Cancel()
 		}
