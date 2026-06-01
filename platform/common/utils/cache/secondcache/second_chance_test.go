@@ -10,7 +10,9 @@ import (
 	"crypto/rand"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -120,6 +122,159 @@ func TestSecondChanceCacheConcurrent(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestSecondChanceCacheGetOrLoadCoalescesConcurrentMisses(t *testing.T) {
+	t.Parallel()
+	cache := NewTyped[int](25)
+
+	const workers = 50
+	var loaderCalls int32
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	var closeLoaderStarted sync.Once
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			val, _, err := cache.GetOrLoad("shared-key", func() (int, error) {
+				atomic.AddInt32(&loaderCalls, 1)
+				closeLoaderStarted.Do(func() { close(loaderStarted) })
+				<-releaseLoader
+
+				return 42, nil
+			})
+			if err != nil {
+				errs <- err
+
+				return
+			}
+			if val != 42 {
+				errs <- fmt.Errorf("expected 42, got %d", val)
+
+				return
+			}
+			errs <- nil
+		}()
+	}
+
+	close(start)
+	select {
+	case <-loaderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("loader was not called")
+	}
+	time.Sleep(20 * time.Millisecond)
+	close(releaseLoader)
+
+	for i := 0; i < workers; i++ {
+		require.NoError(t, <-errs)
+	}
+	require.Equal(t, int32(1), atomic.LoadInt32(&loaderCalls))
+}
+
+func TestSecondChanceCacheGetOrLoadMissDoesNotBlockHits(t *testing.T) {
+	t.Parallel()
+	cache := NewTyped[int](25)
+	cache.Add("hot-key", 7)
+
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	loadDone := make(chan error)
+	go func() {
+		_, _, err := cache.GetOrLoad("cold-key", func() (int, error) {
+			close(loaderStarted)
+			<-releaseLoader
+
+			return 9, nil
+		})
+		loadDone <- err
+	}()
+
+	select {
+	case <-loaderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("loader was not called")
+	}
+
+	hitDone := make(chan error)
+	go func() {
+		val, ok := cache.Get("hot-key")
+		if !ok {
+			hitDone <- errors.New("hot key was not found")
+
+			return
+		}
+		if val != 7 {
+			hitDone <- fmt.Errorf("expected hot key value 7, got %d", val)
+
+			return
+		}
+		hitDone <- nil
+	}()
+
+	select {
+	case err := <-hitDone:
+		require.NoError(t, err)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("cache hit blocked behind a miss loader")
+	}
+
+	close(releaseLoader)
+	require.NoError(t, <-loadDone)
+}
+
+func TestSecondChanceCacheGetOrLoadDoesNotOverwriteConcurrentAdd(t *testing.T) {
+	t.Parallel()
+	cache := NewTyped[int](25)
+
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	type result struct {
+		value int
+		found bool
+		err   error
+	}
+	loadDone := make(chan result)
+	go func() {
+		value, found, err := cache.GetOrLoad("key", func() (int, error) {
+			close(loaderStarted)
+			<-releaseLoader
+
+			return 1, nil
+		})
+		loadDone <- result{value: value, found: found, err: err}
+	}()
+
+	select {
+	case <-loaderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("loader was not called")
+	}
+
+	addDone := make(chan struct{})
+	go func() {
+		cache.Add("key", 2)
+		close(addDone)
+	}()
+
+	select {
+	case <-addDone:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("cache add blocked behind a miss loader")
+	}
+
+	close(releaseLoader)
+	res := <-loadDone
+	require.NoError(t, res.err)
+	require.True(t, res.found)
+	require.Equal(t, 2, res.value)
+
+	value, ok := cache.Get("key")
+	require.True(t, ok)
+	require.Equal(t, 2, value)
 }
 
 func TestSecondChanceCacheDelete(t *testing.T) {
