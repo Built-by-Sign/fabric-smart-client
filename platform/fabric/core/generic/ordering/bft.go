@@ -22,10 +22,7 @@ import (
 	"github.com/hyperledger-labs/fabric-smart-client/platform/view/services/grpc"
 )
 
-const (
-	defaultBFTConnectionPoolSize = 10
-	bftSendRecvTimeout           = 10 * time.Second
-)
+const bftSendRecvTimeout = 10 * time.Second
 
 type bftOrdererState struct {
 	pool  chan *Connection
@@ -46,8 +43,7 @@ type BFTBroadcaster struct {
 func NewBFTBroadcaster(configService driver.ConfigService, cf Services, metrics *metrics.Metrics) *BFTBroadcaster {
 	poolSize := configService.OrdererConnectionPoolSize()
 	if poolSize <= 0 {
-		logger.Warnf("invalid BFT orderer connection pool size [%d], falling back to [%d]", poolSize, defaultBFTConnectionPoolSize)
-		poolSize = defaultBFTConnectionPoolSize
+		logger.Panicf("invalid ordering.connectionPoolSize [%d]: must be > 0", poolSize)
 	}
 	return &BFTBroadcaster{
 		ConfigService: configService,
@@ -174,13 +170,7 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 
 		wg.Wait()
 
-		// Discard connections that hit Send/Recv errors or non-SUCCESS
-		// ack regardless of whether the broadcast met its success
-		// threshold. The previous code only cleaned them up on the
-		// failure path: when a partially-failed broadcast still cleared
-		// threshold (e.g. 3 of 4 orderers acked, the 4th errored on
-		// Recv), the failed connections' semaphore units and gRPC
-		// streams were leaked.
+		// Discard errored connections on every path, including threshold success.
 		for _, connection := range usedConnections {
 			o.discardConnection(connection)
 		}

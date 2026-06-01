@@ -262,24 +262,16 @@ func (s *Service) GetString(key string) string {
 	return s.Configuration.GetString("fabric." + s.prefix + key)
 }
 
+func (s *Service) GetInt(key string) int {
+	return s.Configuration.GetInt("fabric." + s.prefix + key)
+}
+
 func (s *Service) GetDuration(key string) time.Duration {
 	return s.Configuration.GetDuration("fabric." + s.prefix + key)
 }
 
 func (s *Service) GetBool(key string) bool {
 	return s.Configuration.GetBool("fabric." + s.prefix + key)
-}
-
-// GetInt fetches a config int under the fabric prefix.
-//
-// Without this wrapper, Service.GetInt calls would silently fall through
-// to the embedded Configuration.GetInt — which expects an absolute key
-// and therefore returns 0 for every "fabric.<prefix>.foo.bar" lookup.
-// This caused yaml settings like ordering.connectionPoolSize to be read
-// as 0 even when explicitly configured, putting BFT broadcast on the
-// no-pool slow path. Upstream PR #1463 fixes this.
-func (s *Service) GetInt(key string) int {
-	return s.Configuration.GetInt("fabric." + s.prefix + key)
 }
 
 func (s *Service) IsSet(key string) bool {

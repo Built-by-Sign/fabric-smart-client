@@ -9,11 +9,10 @@ package main
 import (
 	_ "net/http/pprof"
 	"os"
-	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 
+	"github.com/hyperledger-labs/fabric-smart-client/cmd/fsccli/validate"
 	"github.com/hyperledger-labs/fabric-smart-client/cmd/fsccli/version"
 	"github.com/hyperledger-labs/fabric-smart-client/integration/nwo/cmd/artifactgen"
 	"github.com/hyperledger-labs/fabric-smart-client/integration/nwo/cmd/cryptogen"
@@ -21,23 +20,14 @@ import (
 	view "github.com/hyperledger-labs/fabric-smart-client/platform/view/services/view/grpc/client/cmd"
 )
 
-const CmdRoot = "fsccli"
-
-// The main command describes the service and
-// defaults to printing the help message.
-var mainCmd = &cobra.Command{Use: "fsccli"}
-
 func main() {
-	// For environment variables.
-	viper.SetEnvPrefix(CmdRoot)
-	viper.AutomaticEnv()
-	replacer := strings.NewReplacer(".", "_")
-	viper.SetEnvKeyReplacer(replacer)
+	mainCmd := &cobra.Command{Use: "fsccli"}
 
 	mainCmd.AddCommand(artifactgen.NewCmd())
 	mainCmd.AddCommand(cryptogen.NewCmd())
 	mainCmd.AddCommand(view.NewCmd())
 	mainCmd.AddCommand(hsm.NewCmd())
+	mainCmd.AddCommand(validate.NewCmd())
 	mainCmd.AddCommand(version.Cmd())
 
 	// On failure Cobra prints the usage message and error string, so we only
