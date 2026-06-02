@@ -226,3 +226,60 @@ func TestGetOrLoadErrorPropagates(t *testing.T) {
 		t.Errorf("got %d want 5", v)
 	}
 }
+
+// A slow loader for a cold key must not block concurrent Get hits on other
+// keys: the loader runs outside the cache lock.
+func TestGetOrLoadMissDoesNotBlockHits(t *testing.T) {
+	t.Parallel()
+	cache := NewTyped[int](25)
+	cache.Add("hot-key", 7)
+
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	loadDone := make(chan error)
+	go func() {
+		_, _, err := cache.GetOrLoad("cold-key", func() (int, error) {
+			close(loaderStarted)
+			<-releaseLoader
+
+			return 9, nil
+		})
+		loadDone <- err
+	}()
+
+	select {
+	case <-loaderStarted:
+	case <-time.After(time.Second):
+		t.Fatal("loader was not called")
+	}
+
+	hitDone := make(chan error)
+	go func() {
+		val, ok := cache.Get("hot-key")
+		if !ok {
+			hitDone <- errors.New("hot key was not found")
+
+			return
+		}
+		if val != 7 {
+			hitDone <- fmt.Errorf("expected hot key value 7, got %d", val)
+
+			return
+		}
+		hitDone <- nil
+	}()
+
+	select {
+	case err := <-hitDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("cache hit blocked behind a miss loader")
+	}
+
+	close(releaseLoader)
+	if err := <-loadDone; err != nil {
+		t.Fatalf("loader returned error: %v", err)
+	}
+}
