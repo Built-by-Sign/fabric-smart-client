@@ -118,33 +118,41 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 
 		var lock sync.Mutex
 
+		// Bound this iteration with a cancelable context so that, once f+1 acks
+		// land, the remaining orderers' getConnection/SendAndRecv unblock
+		// immediately. Without this, broadcast latency = max(orderer RTT): a
+		// single congested orderer pins every broadcast to its connection wait.
+		iterCtx, cancel := context.WithCancel(ctx)
+		thresholdMet := make(chan struct{})
+		var thresholdOnce sync.Once
+
 		for _, orderer := range orderers {
 			go func(orderer *grpc.ConnectionConfig) {
 				defer wg.Done()
 
-				logger.DebugfContext(ctx, "get connection to [%s]", orderer.Address)
+				logger.DebugfContext(iterCtx, "get connection to [%s]", orderer.Address)
 				getConnStart := time.Now()
-				connection, err := o.getConnection(ctx, orderer)
-				recordBFTPhase(ctx, bftGetConn, time.Since(getConnStart), err, orderer.Address)
+				connection, err := o.getConnection(iterCtx, orderer)
+				recordBFTPhase(iterCtx, bftGetConn, time.Since(getConnStart), err, orderer.Address)
 
 				lock.Lock()
 				if err != nil {
 					errs = append(errs, errors.Wrapf(err, "failed connecting to [%v]", orderer.Address))
-					logger.WarnfContext(ctx, "failed to get connection to orderer [%s]", orderer.Address, err)
+					logger.WarnfContext(iterCtx, "failed to get connection to orderer [%s]", orderer.Address, err)
 					lock.Unlock()
 					return
 				}
 
 				lock.Unlock()
 
-				logger.DebugfContext(ctx, "broadcast to [%s]", orderer.Address)
-				sendRecvCtx, cancel := context.WithTimeout(ctx, bftSendRecvTimeout)
+				logger.DebugfContext(iterCtx, "broadcast to [%s]", orderer.Address)
+				sendRecvCtx, srCancel := context.WithTimeout(iterCtx, bftSendRecvTimeout)
 				sendRecvStart := time.Now()
 				status, err := connection.SendAndRecv(sendRecvCtx, env)
-				recordBFTPhase(ctx, bftSendRecv, time.Since(sendRecvStart), err, orderer.Address)
-				cancel()
+				recordBFTPhase(iterCtx, bftSendRecv, time.Since(sendRecvStart), err, orderer.Address)
+				srCancel()
 				if err != nil {
-					logger.ErrorfContext(ctx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
+					logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
 					lock.Lock()
 					defer lock.Unlock()
 					usedConnections = append(usedConnections, connection)
@@ -159,25 +167,43 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 				case common2.Status_SUCCESS:
 					o.releaseConnection(connection, orderer)
 					counter++
+					if counter >= threshold {
+						thresholdOnce.Do(func() { close(thresholdMet) })
+					}
 				default:
 					usedConnections = append(usedConnections, connection)
-					logger.ErrorfContext(ctx, "failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(status.GetStatus())])
+					logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(status.GetStatus())])
 					errs = append(errs, fmt.Errorf("failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(status.GetStatus())]))
 					return
 				}
 			}(orderer)
 		}
 
-		wg.Wait()
+		// Discard errored connections once every sub-goroutine has finished, on
+		// both the fast-return and full-wait paths, so a late arrival can't leak
+		// its connection (and pool slot) after we've already returned.
+		allDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			cancel()
+			lock.Lock()
+			toDiscard := append([]*Connection(nil), usedConnections...)
+			lock.Unlock()
+			for _, connection := range toDiscard {
+				o.discardConnection(connection)
+			}
+			close(allDone)
+		}()
 
-		// Discard errored connections on every path, including threshold success.
-		for _, connection := range usedConnections {
-			o.discardConnection(connection)
-		}
-
-		if counter >= threshold {
-			// success
+		select {
+		case <-thresholdMet:
+			// f+1 acks observed; cancel the remaining orderers and return
+			// without waiting for the slowest. Cleanup runs in the goroutine
+			// above once the cancelled sub-goroutines unwind.
+			cancel()
 			return nil
+		case <-allDone:
+			// all orderers finished without reaching threshold
 		}
 
 		// fail
