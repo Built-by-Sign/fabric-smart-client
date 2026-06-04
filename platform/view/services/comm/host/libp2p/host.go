@@ -229,7 +229,10 @@ func (h *host) NewStream(ctx context.Context, info host2.StreamInfo) (host2.P2PS
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to get mutliaddr for [%s]", info.RemotePeerAddress)
 		}
-		ps.AddAddr(ID, s, peerstore.RecentlyConnectedAddrTTL)
+		// Static CBDC cluster: persist resolved peer addresses permanently so a
+		// later re-dial (StreamInfo without RemotePeerAddress) never fails with
+		// "no addresses" after the short RecentlyConnectedAddrTTL expires under load.
+		ps.AddAddr(ID, s, peerstore.PermanentAddrTTL)
 	}
 
 	nwStream, err := h.Host.NewStream(ctx, ID, viewProtocol)
