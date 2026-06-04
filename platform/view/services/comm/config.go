@@ -21,6 +21,7 @@ type configService interface {
 type config struct {
 	incomingMessagesBufferSize int
 	streamReaderBufferSize     int
+	dispatcherWorkers          int
 }
 
 func NewConfig(cs configService) *config {
@@ -34,8 +35,14 @@ func NewConfig(cs configService) *config {
 		streamReaderBufferSize = cs.GetInt("fsc.p2p.streamReaderBufferSize")
 	}
 
+	dispatcherWorkers := DefaultDispatcherWorkers
+	if cs.IsSet("fsc.p2p.dispatcherWorkers") {
+		dispatcherWorkers = cs.GetInt("fsc.p2p.dispatcherWorkers")
+	}
+
 	return &config{
 		incomingMessagesBufferSize: incomingMessagesBufferSize,
 		streamReaderBufferSize:     streamReaderBufferSize,
+		dispatcherWorkers:          dispatcherWorkers,
 	}
 }

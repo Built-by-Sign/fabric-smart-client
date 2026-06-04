@@ -32,7 +32,9 @@ const (
 	contextIDLabel tracing.LabelName = "context_id"
 	sessionIDLabel tracing.LabelName = "session_id"
 
-	DefaultDispatcherWorkers = 1
+	// DefaultDispatcherWorkers drain the shared incomingMessages channel. >1 keeps a single
+	// slow/stuck session from stalling all P2P receive. Override via fsc.p2p.dispatcherWorkers.
+	DefaultDispatcherWorkers = 16
 	DefaultDispatcherTimeout = 5 * time.Second
 )
 
@@ -79,6 +81,9 @@ func NewNodeWithConfig(ctx context.Context, h host2.P2PHost, metricsProvider met
 	if cfg.streamReaderBufferSize <= 0 {
 		cfg.streamReaderBufferSize = DefaultStreamReaderBufferSize
 	}
+	if cfg.dispatcherWorkers <= 0 {
+		cfg.dispatcherWorkers = DefaultDispatcherWorkers
+	}
 	nodeCtx, cancel := context.WithCancel(ctx)
 	p := &P2PNode{
 		host:                       h,
@@ -89,7 +94,7 @@ func NewNodeWithConfig(ctx context.Context, h host2.P2PHost, metricsProvider met
 		ctx:                        nodeCtx,
 		cancel:                     cancel,
 		m:                          newMetrics(metricsProvider),
-		numWorkers:                 DefaultDispatcherWorkers,
+		numWorkers:                 cfg.dispatcherWorkers,
 		incomingMessagesBufferSize: cfg.incomingMessagesBufferSize,
 		streamReaderBufferSize:     cfg.streamReaderBufferSize,
 	}
@@ -200,7 +205,7 @@ func (p *P2PNode) dispatchMessages(ctx context.Context) {
 				delivered = session.enqueueWithTimeout(msg.message, DefaultDispatcherTimeout)
 				logger.Debugf("Enqueue with timeout result for session [%s]: %v", internalSessionID, delivered)
 			} else {
-				delivered = session.enqueue(msg.message)
+				delivered = session.enqueueWithTimeout(msg.message, DefaultDispatcherTimeout)
 				logger.Debugf("Enqueue result for session [%s]: %v", internalSessionID, delivered)
 			}
 			if delivered {
