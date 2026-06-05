@@ -244,9 +244,6 @@ func (cm *Manager) RegisterContext(contextID string, ctx DisposableContext) erro
 // NewResponderContext returns a context to be used to respond to an incoming message on the given session.
 // It returns the context, a boolean indicating if it's new, and an error.
 func (cm *Manager) NewResponderContext(ctx context.Context, contextID string, session view.Session, me, remote view.Identity) (view.Context, bool, error) {
-	cm.contextsMu.Lock()
-	defer cm.contextsMu.Unlock()
-
 	if me.IsNone() {
 		me = cm.identityProvider.DefaultIdentity()
 	}
@@ -254,33 +251,38 @@ func (cm *Manager) NewResponderContext(ctx context.Context, contextID string, se
 	sessionID := session.Info().ID
 	caller := session.Info().Caller
 
-	// check if a viewContext already exists for the given contextID
-	viewContext, ok := cm.contexts[contextID]
-	if ok && viewContext.Session() != nil && viewContext.Session().Info().ID != sessionID {
-		// next we need to unwrap the actual context to store the session
-		vCtx, ok := viewContext.(ParentContext)
-		if !ok {
-			panic("Not a ParentContext!")
+	// Existing context: handle session swap / reuse under the lock.
+	cm.contextsMu.Lock()
+	if viewContext, ok := cm.contexts[contextID]; ok {
+		if viewContext.Session() != nil && viewContext.Session().Info().ID != sessionID {
+			// next we need to unwrap the actual context to store the session
+			vCtx, ok := viewContext.(ParentContext)
+			if !ok {
+				cm.contextsMu.Unlock()
+				panic("Not a ParentContext!")
+			}
+
+			// TODO: replace this with `vCtx.PutSession`, however, that method requires a view as input but we only have the viewID
+			if err := vCtx.PutSessionByID(string(caller), remote, session); err != nil {
+				cm.contextsMu.Unlock()
+				return nil, false, errors.Wrapf(err, "failed registering session for [%s]", caller)
+			}
+
+			// we wrap our context and set our new session as the default session
+			c := NewChildContextFromParentAndSession(vCtx, session)
+			cm.contexts[contextID] = c
+			cm.metrics.Contexts.Set(float64(len(cm.contexts)))
+			cm.contextsMu.Unlock()
+
+			return c, false, nil
 		}
-
-		// TODO: replace this with `vCtx.PutSession`, however, that method requires a view as input but we only have the viewID
-		if err := vCtx.PutSessionByID(string(caller), remote, session); err != nil {
-			return nil, false, errors.Wrapf(err, "failed registering session for [%s]", caller)
-		}
-
-		// we wrap our context and set our new session as the default session
-		c := NewChildContextFromParentAndSession(vCtx, session)
-		cm.contexts[contextID] = c
-		cm.metrics.Contexts.Set(float64(len(cm.contexts)))
-
-		return c, false, nil
-	}
-	if ok {
 		logger.DebugfContext(viewContext.Context(), "[%s] No new context to respond, reuse [contextID:%s]\n", me, contextID)
+		cm.contextsMu.Unlock()
 		return viewContext, false, nil
 	}
+	cm.contextsMu.Unlock()
 
-	// next we continue with creating a new context
+	// Create the new context outside the lock so concurrent responders don't serialize on contextsMu.
 	logger.Debugf("[%s] Create new context to respond [contextID:%s]\n", me, contextID)
 	newCtx, err := cm.contextFactory.NewForResponder(
 		ctx,
@@ -294,8 +296,16 @@ func (cm *Manager) NewResponderContext(ctx context.Context, contextID string, se
 	}
 
 	c := NewChildContextFromParent(newCtx)
+
+	// Publish under the lock; double-check in case a concurrent responder for the same contextID won the race.
+	cm.contextsMu.Lock()
+	if existing, ok := cm.contexts[contextID]; ok {
+		cm.contextsMu.Unlock()
+		return existing, false, nil
+	}
 	cm.contexts[contextID] = c
 	cm.metrics.Contexts.Set(float64(len(cm.contexts)))
+	cm.contextsMu.Unlock()
 
 	context.AfterFunc(c.Context(), func() {
 		cm.DeleteContext(contextID)
