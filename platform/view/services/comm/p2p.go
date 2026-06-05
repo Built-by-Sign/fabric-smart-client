@@ -230,6 +230,28 @@ func (p *P2PNode) dispatchMessages(ctx context.Context) {
 	}
 }
 
+// maxStreamsPerPeer bounds how many outgoing streams sendWithCachedStreams
+// fans out to per peer before falling back to a blocking send on an existing
+// stream. libp2p hashes streams by peer ID only, so without fan-out every send
+// to a peer serializes on one stream's write lock + yamux window; without a cap
+// a sustained burst against a slow peer could open unbounded streams.
+const maxStreamsPerPeer = 8
+
+// registerStreamInSession leases the stream into the session so it is closed
+// with the session. No-op when session is nil.
+func (p *P2PNode) registerStreamInSession(session *NetworkStreamSession, stream *streamHandler) {
+	if session == nil {
+		return
+	}
+	session.mutex.Lock()
+	if _, registered := session.streams[stream]; !registered {
+		if stream.tryLease() {
+			session.streams[stream] = struct{}{}
+		}
+	}
+	session.mutex.Unlock()
+}
+
 func (p *P2PNode) sendWithCachedStreams(streamHash string, msg proto.Message, session *NetworkStreamSession) error {
 	if len(streamHash) == 0 {
 		logger.Debugf("empty stream hash probably because of uninitialized data. New stream must be created.")
@@ -243,26 +265,44 @@ func (p *P2PNode) sendWithCachedStreams(streamHash string, msg proto.Message, se
 	p.streamsMutex.RUnlock()
 
 	logger.Debugf("send msg to stream hash [%s] of [%d] with #stream [%d]", streamHash, totalNumStreams, len(streamsCopy))
+
+	// Fan out: try each live cached stream without blocking on its write lock.
+	// A busy stream (another send mid-write) is skipped so concurrent sends to
+	// the same peer spread across streams instead of serializing on one.
+	live := 0
 	for _, stream := range streamsCopy {
 		if stream.isDead() || stream.isClosed() {
 			continue
 		}
-		err := stream.send(msg)
-		if err == nil {
+		live++
+		busy, err := stream.trySend(msg)
+		if err != nil {
+			logger.Errorf("error while sending message to stream with hash [%s]: %s", streamHash, err)
+			continue
+		}
+		if !busy {
 			logger.Debugf("sent msg with stream [%s]", stream.stream.Hash())
-			if session != nil {
-				session.mutex.Lock()
-				if _, streamRegisteredAlready := session.streams[stream]; !streamRegisteredAlready {
-					if stream.tryLease() {
-						session.streams[stream] = struct{}{}
-					}
-				}
-				session.mutex.Unlock()
-			}
+			p.registerStreamInSession(session, stream)
 			return nil
 		}
-		// TODO: handle the case in which there's an error
-		logger.Errorf("error while sending message to stream with hash [%s]: %s", streamHash, err)
+	}
+
+	// Nothing took the message. Below the cap, ask sendTo to open a fresh
+	// stream (more parallelism). At the cap, block on a live stream so the
+	// number of open streams per peer stays bounded.
+	if live < maxStreamsPerPeer {
+		return errors.Wrapf(errStreamNotFound, "all [%d] cached streams busy/failed for hash [%s]", len(streamsCopy), streamHash)
+	}
+	for _, stream := range streamsCopy {
+		if stream.isDead() || stream.isClosed() {
+			continue
+		}
+		if err := stream.send(msg); err != nil {
+			logger.Errorf("error while sending message to stream with hash [%s]: %s", streamHash, err)
+			continue
+		}
+		p.registerStreamInSession(session, stream)
+		return nil
 	}
 
 	return errors.Wrapf(errStreamNotFound, "all [%d] streams for hash [%s] failed to send", len(streamsCopy), streamHash)
@@ -397,6 +437,26 @@ func (s *streamHandler) send(msg proto.Message) error {
 		return err
 	}
 	return nil
+}
+
+// trySend is send() but non-blocking on the per-stream write lock. If another
+// goroutine is mid-write on this stream it returns busy=true without sending,
+// so the caller can fan out to another stream instead of queueing every send
+// to the peer behind one stream's lock + yamux send window.
+func (s *streamHandler) trySend(msg proto.Message) (busy bool, err error) {
+	if !s.lock.TryLock() {
+		return true, nil
+	}
+	defer s.lock.Unlock()
+	if s.isClosed() {
+		return false, errors.New("stream handler is closed")
+	}
+	logger.Debugf("sending message to stream [%s]", s.stream.Hash())
+	if err := s.writer.WriteMsg(msg); err != nil {
+		logger.Errorf("failed sending message to stream [%s]: [%s]", s.stream.Hash(), err)
+		return false, err
+	}
+	return false, nil
 }
 
 func (s *streamHandler) isStopping() bool {
