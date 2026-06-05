@@ -36,8 +36,9 @@ type PKCS11 struct {
 	Pin            string         `yaml:"Pin"`
 	SoftwareVerify bool           `yaml:"SoftwareVerify,omitempty"`
 	Immutable      bool           `yaml:"Immutable,omitempty"`
-	AltID          string         `yaml:"AltId,omitempty"`
-	KeyIDs         []KeyIDMapping `yaml:"KeyIds,omitempty" mapstructure:"KeyIds"`
+	AltID            string         `yaml:"AltId,omitempty"`
+	KeyIDs           []KeyIDMapping `yaml:"KeyIds,omitempty" mapstructure:"KeyIds"`
+	SessionCacheSize uint           `yaml:"SessionCacheSize,omitempty"`
 }
 
 type KeyIDMapping struct {
