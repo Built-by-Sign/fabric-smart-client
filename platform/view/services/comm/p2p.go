@@ -55,6 +55,10 @@ type P2PNode struct {
 	dispatchMutex              sync.Mutex
 	sessionsMutex              sync.Mutex
 	sessions                   map[string]*NetworkStreamSession
+	// topicSessions indexes sessions by topic (sessionID) -> set of internal
+	// session IDs, so DeleteSessions can find a topic's sessions in O(k)
+	// instead of scanning the whole sessions map under sessionsMutex.
+	topicSessions map[string]map[string]struct{}
 	finderWg                   sync.WaitGroup
 	handlersWg                 sync.WaitGroup
 	dispatchWg                 sync.WaitGroup
@@ -90,6 +94,7 @@ func NewNodeWithConfig(ctx context.Context, h host2.P2PHost, metricsProvider met
 		incomingMessages:           make(chan *messageWithStream, cfg.incomingMessagesBufferSize),
 		streams:                    make(map[host2.StreamHash][]*streamHandler),
 		sessions:                   make(map[string]*NetworkStreamSession),
+		topicSessions:              make(map[string]map[string]struct{}),
 		isStopping:                 false,
 		ctx:                        nodeCtx,
 		cancel:                     cancel,

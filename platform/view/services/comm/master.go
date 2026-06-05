@@ -9,7 +9,6 @@ package comm
 import (
 	"context"
 	"encoding/base64"
-	"strings"
 
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/services/logging"
@@ -67,6 +66,10 @@ func (p *P2PNode) getOrCreateSession(sessionID, endpointAddress, contextID, call
 	}
 
 	p.sessions[internalSessionID] = s
+	if p.topicSessions[sessionID] == nil {
+		p.topicSessions[sessionID] = make(map[string]struct{})
+	}
+	p.topicSessions[sessionID][internalSessionID] = struct{}{}
 	p.m.Sessions.Set(float64(len(p.sessions)))
 
 	s.tryStart()
@@ -98,16 +101,24 @@ func (p *P2PNode) MasterSession() (view.Session, error) {
 }
 
 func (p *P2PNode) DeleteSessions(_ context.Context, sessionID string) {
+	// Find the topic's sessions in O(k) via the index, remove them from the maps
+	// under the lock, then close them outside the lock: closeInternal blocks on a
+	// channel handshake, and holding sessionsMutex through it stalls the incoming
+	// dispatch path (which also needs sessionsMutex) under load.
 	p.sessionsMutex.Lock()
-	defer p.sessionsMutex.Unlock()
-
-	for key, session := range p.sessions {
-		// if key starts with sessionID, delete it
-		if strings.HasPrefix(key, sessionID) {
-			logger.Debugf("deleting session [%s]", key)
-			session.closeInternal()
-			delete(p.sessions, key)
+	toClose := make([]*NetworkStreamSession, 0, len(p.topicSessions[sessionID]))
+	for internalSessionID := range p.topicSessions[sessionID] {
+		if session, in := p.sessions[internalSessionID]; in {
+			logger.Debugf("deleting session [%s]", internalSessionID)
+			toClose = append(toClose, session)
+			delete(p.sessions, internalSessionID)
 		}
 	}
+	delete(p.topicSessions, sessionID)
 	p.m.Sessions.Set(float64(len(p.sessions)))
+	p.sessionsMutex.Unlock()
+
+	for _, session := range toClose {
+		session.closeInternal()
+	}
 }

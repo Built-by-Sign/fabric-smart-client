@@ -378,16 +378,20 @@ func (cm *Manager) ExistResponderForCaller(caller string) (view.View, view.Ident
 func (cm *Manager) DeleteContext(contextID string) {
 	sh := cm.contexts.shard(contextID)
 	sh.mu.Lock()
-	// dispose context
-	if viewCtx, ok := sh.m[contextID]; ok {
-		viewCtx.Dispose()
+	viewCtx, ok := sh.m[contextID]
+	if ok {
 		delete(sh.m, contextID)
 		cm.contexts.count.Add(-1)
-		sh.mu.Unlock()
-		cm.metrics.Contexts.Set(float64(cm.contexts.len()))
-		return
 	}
 	sh.mu.Unlock()
+
+	// Dispose outside the shard lock: it tears down the context's sessions via
+	// the comm layer (its own locks + channel handshakes), so holding the shard
+	// lock across it would serialize unrelated contextIDs in the same shard.
+	if ok {
+		viewCtx.Dispose()
+		cm.metrics.Contexts.Set(float64(cm.contexts.len()))
+	}
 }
 
 // Runner models a view runner.
