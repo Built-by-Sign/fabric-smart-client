@@ -31,27 +31,49 @@ type DbProvider interface {
 
 func NewDbProvider() DbProvider { return lazy.NewProviderWithKeyMapper(key, Open) }
 
-func key(o Opts) string { return o.DataSource }
+func key(o Opts) string { return o.DataSource + "|" + o.WriteDataSource }
 
 func Open(opts Opts) (*common.RWDB, error) {
-	db, err := sqlOpen(opts.DataSource, opts.Tracing)
+	readDB, err := openDB(opts.DataSource, opts.MaxOpenConns, opts.MaxIdleConns, opts.MaxIdleTime, opts.Tracing)
 	if err != nil {
 		return nil, fmt.Errorf("can't open %s database: %w", driverName, err)
 	}
 
-	db.SetMaxOpenConns(opts.MaxOpenConns)
-	db.SetMaxIdleConns(opts.MaxIdleConns)
-	db.SetConnMaxIdleTime(opts.MaxIdleTime)
+	if len(opts.WriteDataSource) == 0 {
+		logger.Debugf("connected to [%s] shared read/write pool, max open connections: %d, max idle connections: %d, max idle time: %v", driverName, opts.MaxOpenConns, opts.MaxIdleConns, opts.MaxIdleTime)
 
-	if err = db.Ping(); err != nil {
-		return nil, err
+		return &common.RWDB{
+			ReadDB:  readDB,
+			WriteDB: readDB,
+		}, nil
 	}
-	logger.Debugf("connected to [%s] for reads, max open connections: %d, max idle connections: %d, max idle time: %v", driverName, opts.MaxOpenConns, opts.MaxIdleConns, opts.MaxIdleTime)
+
+	writeDB, err := openDB(opts.WriteDataSource, opts.WriteMaxOpenConns, opts.WriteMaxIdleConns, opts.WriteMaxIdleTime, opts.Tracing)
+	if err != nil {
+		readDB.Close()
+		return nil, fmt.Errorf("can't open %s write database: %w", driverName, err)
+	}
+	logger.Debugf("connected to [%s] split pools, read max open connections: %d, write max open connections: %d", driverName, opts.MaxOpenConns, opts.WriteMaxOpenConns)
 
 	return &common.RWDB{
-		ReadDB:  db,
-		WriteDB: db,
+		ReadDB:  readDB,
+		WriteDB: writeDB,
 	}, nil
+}
+
+func openDB(dataSource string, maxOpenConns, maxIdleConns int, maxIdleTime time.Duration, tracing *common2.TracingConfig) (*sql.DB, error) {
+	db, err := sqlOpen(dataSource, tracing)
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxIdleConns)
+	db.SetConnMaxIdleTime(maxIdleTime)
+	if err = db.Ping(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 func sqlOpen(dataSourceName string, tracing *common2.TracingConfig) (*sql.DB, error) {
@@ -64,11 +86,15 @@ func sqlOpen(dataSourceName string, tracing *common2.TracingConfig) (*sql.DB, er
 }
 
 type Opts struct {
-	DataSource      string
-	MaxOpenConns    int
-	MaxIdleConns    int
-	MaxIdleTime     time.Duration
-	TablePrefix     string
-	TableNameParams []string
-	Tracing         *common2.TracingConfig
+	DataSource        string
+	MaxOpenConns      int
+	MaxIdleConns      int
+	MaxIdleTime       time.Duration
+	WriteDataSource   string
+	WriteMaxOpenConns int
+	WriteMaxIdleConns int
+	WriteMaxIdleTime  time.Duration
+	TablePrefix       string
+	TableNameParams   []string
+	Tracing           *common2.TracingConfig
 }

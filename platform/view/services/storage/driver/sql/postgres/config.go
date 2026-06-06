@@ -21,14 +21,18 @@ type config interface {
 }
 
 type Config struct {
-	TablePrefix     string
-	DataSource      string
-	MaxOpenConns    int
-	MaxIdleConns    *int
-	MaxIdleTime     *time.Duration
-	SkipCreateTable bool
-	TableNameParams []string
-	Tracing         *common2.TracingConfig
+	TablePrefix       string
+	DataSource        string
+	MaxOpenConns      int
+	MaxIdleConns      *int
+	MaxIdleTime       *time.Duration
+	WriteDataSource   string
+	WriteMaxOpenConns *int
+	WriteMaxIdleConns *int
+	WriteMaxIdleTime  *time.Duration
+	SkipCreateTable   bool
+	TableNameParams   []string
+	Tracing           *common2.TracingConfig
 }
 
 func NewConfigProvider(config config) *ConfigProvider {
@@ -52,6 +56,17 @@ func (r *ConfigProvider) GetOpts(name driver.PersistenceName, params ...string) 
 	}
 	if o.MaxIdleTime == nil {
 		o.MaxIdleTime = common3.CopyPtr(common3.DefaultMaxIdleTime)
+	}
+	if len(o.WriteDataSource) != 0 {
+		if o.WriteMaxOpenConns == nil {
+			o.WriteMaxOpenConns = common3.CopyPtr(o.MaxOpenConns)
+		}
+		if o.WriteMaxIdleConns == nil {
+			o.WriteMaxIdleConns = common3.CopyPtr(*o.MaxIdleConns)
+		}
+		if o.WriteMaxIdleTime == nil {
+			o.WriteMaxIdleTime = common3.CopyPtr(*o.MaxIdleTime)
+		}
 	}
 	o.TableNameParams = params
 	o.Tracing = &common2.TracingConfig{}

@@ -66,13 +66,17 @@ func NewPersistenceWithOpts[V common3.DBObject](cfg *ConfigProvider, dbProvider 
 	}
 
 	opts := Opts{
-		DataSource:      o.DataSource,
-		MaxOpenConns:    o.MaxOpenConns,
-		MaxIdleConns:    *o.MaxIdleConns,
-		MaxIdleTime:     *o.MaxIdleTime,
-		TablePrefix:     o.TablePrefix,
-		TableNameParams: o.TableNameParams,
-		Tracing:         o.Tracing,
+		DataSource:        o.DataSource,
+		MaxOpenConns:      o.MaxOpenConns,
+		MaxIdleConns:      *o.MaxIdleConns,
+		MaxIdleTime:       *o.MaxIdleTime,
+		WriteDataSource:   o.WriteDataSource,
+		WriteMaxOpenConns: ptrValue(o.WriteMaxOpenConns),
+		WriteMaxIdleConns: ptrValue(o.WriteMaxIdleConns),
+		WriteMaxIdleTime:  ptrValue(o.WriteMaxIdleTime),
+		TablePrefix:       o.TablePrefix,
+		TableNameParams:   o.TableNameParams,
+		Tracing:           o.Tracing,
 	}
 	dbs, err := dbProvider.Get(opts)
 	if err != nil {
@@ -89,4 +93,12 @@ func NewPersistenceWithOpts[V common3.DBObject](cfg *ConfigProvider, dbProvider 
 		}
 	}
 	return p, nil
+}
+
+func ptrValue[T any](p *T) T {
+	if p == nil {
+		var zero T
+		return zero
+	}
+	return *p
 }
