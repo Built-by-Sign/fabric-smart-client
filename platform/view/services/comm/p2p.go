@@ -52,7 +52,6 @@ type P2PNode struct {
 	incomingMessages           chan *messageWithStream
 	streamsMutex               sync.RWMutex
 	streams                    map[host2.StreamHash][]*streamHandler
-	dispatchMutex              sync.Mutex
 	sessionsMutex              sync.Mutex
 	sessions                   map[string]*NetworkStreamSession
 	// topicSessions indexes sessions by topic (sessionID) -> set of internal
@@ -162,8 +161,10 @@ func (p *P2PNode) dispatchMessages(ctx context.Context) {
 
 			logger.Debugf("dispatch message for context [%s] from [%s,%s] on session [%s]", msg.message.ContextID, msg.message.FromEndpoint, view.Identity(msg.message.FromPKID), msg.message.SessionID)
 
-			p.dispatchMutex.Lock()
-
+			// No global dispatch lock: sessionsMutex guards the session map and
+			// the master-session fallback below is idempotent, so dispatch
+			// workers resolve sessions in parallel (the point of >1 worker:
+			// one slow session must not stall all P2P receive).
 			p.sessionsMutex.Lock()
 			internalSessionID := computeInternalSessionID(msg.message.SessionID, msg.message.FromPKID)
 			logger.Debugf("dispatch message on internal session [%s]", internalSessionID)
@@ -191,7 +192,6 @@ func (p *P2PNode) dispatchMessages(ctx context.Context) {
 				logger.Debugf("internal session does not exists [%s], dispatching to master session", internalSessionID)
 				session, _ = p.getOrCreateSession(masterSession, "", "", "", nil, []byte{}, nil)
 			}
-			p.dispatchMutex.Unlock()
 
 			// here we know that msg.stream is used for session:
 			// 1) increment the used counter for msg.stream
