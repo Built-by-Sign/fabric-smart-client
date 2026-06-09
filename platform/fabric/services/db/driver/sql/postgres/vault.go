@@ -51,7 +51,10 @@ func (db *VaultStore) Store(ctx context.Context, txIDs []driver.TxID, writes dri
 	db.GlobalLock.RLock()
 	defer db.GlobalLock.RUnlock()
 
-	tx, err := db.writeDB.Begin()
+	// BeginTx(ctx) ties the transaction to the request context so a canceled
+	// request (e.g. HTTP timeout) auto-rolls-back and releases the connection,
+	// instead of leaving it idle-in-transaction and exhausting the pool.
+	tx, err := db.writeDB.BeginTx(ctx, nil)
 	if err != nil {
 		return errors.Wrapf(err, "failed to initiate db transaction")
 	}
