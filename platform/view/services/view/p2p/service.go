@@ -9,6 +9,7 @@ package p2p
 import (
 	"context"
 	"runtime/debug"
+	"sync"
 
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/services/logging"
@@ -76,6 +77,21 @@ type Service struct {
 	endpointService  EndpointService
 	commLayer        CommLayer
 	runner           Runner
+
+	// activeMu guards activeResponders: in-flight responder counts per context
+	// ID. A caller may open a second session into the same context (e.g. a
+	// retry after a lost message); the context must be disposed only when the
+	// LAST responder finishes, not when the first one does.
+	activeMu         sync.Mutex
+	activeResponders map[string]*responderContextRef
+}
+
+// responderContextRef tracks how many responders are running on a context and
+// whether this node created the context for responding (and thus owns its
+// disposal).
+type responderContextRef struct {
+	count     int
+	deletable bool
 }
 
 // NewService returns a new instance of the P2P service.
@@ -92,7 +108,50 @@ func NewService(
 		commLayer:        commLayer,
 		endpointService:  endpointService,
 		runner:           runner,
+		activeResponders: map[string]*responderContextRef{},
 	}
+}
+
+// retainContext registers an in-flight responder for the given context ID.
+// It is called before the context is resolved so a concurrent last-responder
+// release cannot dispose the context in between.
+func (s *Service) retainContext(contextID string) {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	ref, ok := s.activeResponders[contextID]
+	if !ok {
+		ref = &responderContextRef{}
+		s.activeResponders[contextID] = ref
+	}
+	ref.count++
+}
+
+// markContextDeletable records that this node created the context for
+// responding, so the last responder to finish must dispose it.
+func (s *Service) markContextDeletable(contextID string) {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	if ref, ok := s.activeResponders[contextID]; ok {
+		ref.deletable = true
+	}
+}
+
+// releaseContext unregisters an in-flight responder and reports whether the
+// caller must dispose the context (last responder out on a context this node
+// created for responding).
+func (s *Service) releaseContext(contextID string) bool {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	ref, ok := s.activeResponders[contextID]
+	if !ok {
+		return false
+	}
+	ref.count--
+	if ref.count > 0 {
+		return false
+	}
+	delete(s.activeResponders, contextID)
+	return ref.deletable
 }
 
 // Start starts the P2P service.
@@ -142,6 +201,17 @@ func (s *Service) respond(responder view.View, id view.Identity, msg *view.Messa
 		}
 	}()
 
+	// Retain before resolving the context: a caller may run several sessions
+	// on the same context (e.g. a retry after a lost message), and disposing
+	// on the FIRST responder's exit would tear down sessions the others are
+	// still using. The context is disposed by the LAST responder out.
+	s.retainContext(msg.ContextID)
+	defer func() {
+		if s.releaseContext(msg.ContextID) {
+			s.viewManager.DeleteContext(msg.ContextID)
+		}
+	}()
+
 	// get context
 	viewCtx, isNew, err := s.getOrCreateContext(id, msg)
 	if err != nil {
@@ -150,10 +220,10 @@ func (s *Service) respond(responder view.View, id view.Identity, msg *view.Messa
 
 	logger.DebugfContext(viewCtx.Context(), "[%s] Respond [from:%s], [sessionID:%s], [contextID:%s](%v), [view:%s]", id, msg.FromEndpoint, msg.SessionID, msg.ContextID, isNew, logging.Identifier(responder))
 
-	// if a new context has been created to run the responder,
-	// then dispose the context when not needed anymore
+	// if a new context has been created to run the responder, this node owns
+	// its disposal (performed by the last responder's release above)
 	if isNew {
-		defer s.viewManager.DeleteContext(viewCtx.ID())
+		s.markContextDeletable(msg.ContextID)
 	}
 
 	// run view
