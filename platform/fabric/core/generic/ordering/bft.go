@@ -45,13 +45,15 @@ func NewBFTBroadcaster(configService driver.ConfigService, cf Services, metrics 
 	if poolSize <= 0 {
 		logger.Panicf("invalid ordering.connectionPoolSize [%d]: must be > 0", poolSize)
 	}
-	return &BFTBroadcaster{
+	b := &BFTBroadcaster{
 		ConfigService: configService,
 		ClientFactory: cf,
 		states:        map[string]*bftOrdererState{},
 		metrics:       metrics,
 		poolSize:      poolSize,
 	}
+	registerBFTPoolGauge(b)
+	return b
 }
 
 func (o *BFTBroadcaster) ordererState(addr string) *bftOrdererState {
@@ -119,9 +121,10 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 		var lock sync.Mutex
 
 		// Bound this iteration with a cancelable context so that, once f+1 acks
-		// land, the remaining orderers' getConnection/SendAndRecv unblock
-		// immediately. Without this, broadcast latency = max(orderer RTT): a
-		// single congested orderer pins every broadcast to its connection wait.
+		// land, the remaining orderers' getConnection waits unblock immediately.
+		// Without this, broadcast latency = max(orderer RTT): a single congested
+		// orderer pins every broadcast to its connection wait. In-flight sends
+		// are NOT bound to it — see the detach note below.
 		iterCtx, cancel := context.WithCancel(ctx)
 		thresholdMet := make(chan struct{})
 		var thresholdOnce sync.Once
@@ -146,12 +149,22 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 				lock.Unlock()
 
 				logger.DebugfContext(iterCtx, "broadcast to [%s]", orderer.Address)
-				sendRecvCtx, srCancel := context.WithTimeout(iterCtx, bftSendRecvTimeout)
+				// The in-flight send is detached from iterCtx on purpose: once a
+				// send is on the wire, cancelling it can only destroy the
+				// connection (a half-read stream cannot be reused). Legs that
+				// lose the threshold race finish in the background, bounded by
+				// bftSendRecvTimeout, and return their connection to the pool.
+				sendRecvCtx, srCancel := context.WithTimeout(context.WithoutCancel(iterCtx), bftSendRecvTimeout)
 				sendRecvStart := time.Now()
 				status, err := connection.SendAndRecv(sendRecvCtx, env)
 				recordBFTPhase(iterCtx, bftSendRecv, time.Since(sendRecvStart), err, orderer.Address)
 				srCancel()
 				if err != nil {
+					reason := bftDiscardSendErr
+					if errors.Is(err, context.DeadlineExceeded) {
+						reason = bftDiscardTimeout
+					}
+					recordBFTDiscard(iterCtx, orderer.Address, reason)
 					logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, err.Error())
 					lock.Lock()
 					defer lock.Unlock()
@@ -171,6 +184,7 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 						thresholdOnce.Do(func() { close(thresholdMet) })
 					}
 				default:
+					recordBFTDiscard(iterCtx, orderer.Address, bftDiscardStatusErr)
 					usedConnections = append(usedConnections, connection)
 					logger.ErrorfContext(iterCtx, "failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(status.GetStatus())])
 					errs = append(errs, fmt.Errorf("failed to get status after broadcast to [%s]: %s", orderer.Address, common2.Status_name[int32(status.GetStatus())]))
@@ -181,7 +195,8 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 
 		// Discard errored connections once every sub-goroutine has finished, on
 		// both the fast-return and full-wait paths, so a late arrival can't leak
-		// its connection (and pool slot) after we've already returned.
+		// its connection (and pool slot) after we've already returned. Detached
+		// legs keep this goroutine alive for up to bftSendRecvTimeout.
 		allDone := make(chan struct{})
 		go func() {
 			wg.Wait()
@@ -197,9 +212,10 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 
 		select {
 		case <-thresholdMet:
-			// f+1 acks observed; cancel the remaining orderers and return
-			// without waiting for the slowest. Cleanup runs in the goroutine
-			// above once the cancelled sub-goroutines unwind.
+			// f+1 acks observed; unblock connection waits and return without
+			// waiting for the slowest. In-flight sends finish in the background
+			// and release their connection; cleanup runs in the goroutine above
+			// once every leg unwinds.
 			cancel()
 			return nil
 		case <-allDone:
@@ -217,30 +233,41 @@ func (o *BFTBroadcaster) Broadcast(ctx context.Context, env *common2.Envelope) e
 func (o *BFTBroadcaster) getConnection(ctx context.Context, to *grpc.ConnectionConfig) (*Connection, error) {
 	state := o.ordererState(to.Address)
 
+	// Stage 1: pooled connection, non-blocking.
 	select {
 	case connection := <-state.pool:
+		recordBFTPhase(ctx, bftConnPoolHit, 0, nil, to.Address)
 		return connection, nil
 	default:
 	}
 
+	// Stage 2: free slot, dial a new connection.
 	select {
 	case <-state.slots:
-		return o.createConnectionWithSlot(to, state)
+		return o.createConnectionWithSlot(ctx, to, state)
 	default:
 	}
 
+	// Stage 3: block until a connection returns, a slot frees up, or the
+	// caller gives up.
+	waitStart := time.Now()
 	select {
 	case connection := <-state.pool:
+		recordBFTPhase(ctx, bftConnWait, time.Since(waitStart), nil, to.Address)
 		return connection, nil
 	case <-state.slots:
-		return o.createConnectionWithSlot(to, state)
+		recordBFTPhase(ctx, bftConnWait, time.Since(waitStart), nil, to.Address)
+		return o.createConnectionWithSlot(ctx, to, state)
 	case <-ctx.Done():
+		recordBFTPhase(ctx, bftConnWait, time.Since(waitStart), ctx.Err(), to.Address)
 		return nil, ctx.Err()
 	}
 }
 
-func (o *BFTBroadcaster) createConnectionWithSlot(to *grpc.ConnectionConfig, state *bftOrdererState) (*Connection, error) {
+func (o *BFTBroadcaster) createConnectionWithSlot(ctx context.Context, to *grpc.ConnectionConfig, state *bftOrdererState) (*Connection, error) {
+	dialStart := time.Now()
 	connection, err := o.createConnection(to)
+	recordBFTPhase(ctx, bftConnDial, time.Since(dialStart), err, to.Address)
 	if err != nil {
 		o.releaseSlot(state)
 		return nil, err
@@ -306,6 +333,7 @@ func (o *BFTBroadcaster) releaseConnection(connection *Connection, to *grpc.Conn
 		return
 	default:
 		// if there is not enough space in the channel, then discard the connection
+		recordBFTDiscard(context.Background(), to.Address, bftDiscardPoolFull)
 		o.discardConnection(connection)
 	}
 }

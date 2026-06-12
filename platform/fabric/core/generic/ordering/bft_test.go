@@ -83,6 +83,59 @@ func (fakeOrdererStream) Recv() (*ab.BroadcastResponse, error) {
 }
 func (fakeOrdererStream) CloseSend() error { return nil }
 
+// blockingBroadcastStream blocks Recv until released, simulating a slow
+// orderer whose ack lands after the BFT threshold is already met.
+type blockingBroadcastStream struct {
+	release chan struct{}
+}
+
+func (s *blockingBroadcastStream) Send(*common.Envelope) error { return nil }
+
+func (s *blockingBroadcastStream) Recv() (*ab.BroadcastResponse, error) {
+	<-s.release
+	return &ab.BroadcastResponse{Status: common.Status_SUCCESS}, nil
+}
+
+func (s *blockingBroadcastStream) CloseSend() error { return nil }
+
+// A leg still in flight when the BFT threshold is met must finish in the
+// background and return its connection to the pool. Cancelling it instead
+// destroys a healthy connection on nearly every broadcast (connection churn:
+// the slowest orderer's connection would be redialed with a full TLS
+// handshake each time).
+func TestBFTBroadcaster_SlowLegFinishesInBackgroundAndKeepsConnection(t *testing.T) {
+	t.Parallel()
+
+	orderers := []*grpc.ConnectionConfig{
+		{Address: "o1"}, {Address: "o2"}, {Address: "o3"}, {Address: "o4"},
+	}
+	cfg := &fakeConfigService{poolSize: len(orderers), retries: 1, orderers: orderers}
+	b := NewBFTBroadcaster(cfg, nil, nil)
+
+	slow := &blockingBroadcastStream{release: make(chan struct{})}
+	for _, o := range orderers {
+		state := b.ordererState(o.Address)
+		<-state.slots
+		if o.Address == "o4" {
+			state.pool <- &Connection{Address: o.Address, Stream: slow}
+		} else {
+			state.pool <- &Connection{Address: o.Address, Stream: &fakeBroadcastStream{status: common.Status_SUCCESS}}
+		}
+	}
+
+	// Threshold (3 of 4) is met by the fast orderers; Broadcast returns while
+	// o4's send is still waiting for its ack.
+	require.NoError(t, b.Broadcast(t.Context(), &common.Envelope{}))
+
+	// Let the slow leg finish: its connection must come back to the pool with
+	// the slot still held — not be discarded.
+	close(slow.release)
+	require.Eventually(t, func() bool {
+		return len(b.ordererState("o4").pool) == 1
+	}, 5*time.Second, 10*time.Millisecond, "slow leg's connection should return to the pool")
+	require.Len(t, b.ordererState("o4").slots, len(orderers)-1, "pooled connection keeps holding its slot")
+}
+
 // A connection that errored mid-broadcast must be discarded even when the
 // broadcast meets its BFT threshold and returns success.
 func TestBFTBroadcaster_DiscardsFailedConnectionsOnPartialFailureSuccess(t *testing.T) {
@@ -117,9 +170,13 @@ func TestBFTBroadcaster_DiscardsFailedConnectionsOnPartialFailureSuccess(t *test
 	require.NoError(t, err)
 
 	// o4's errored connection must be discarded, returning its slot, so o4 is
-	// back to full capacity. o1-o3 succeeded and their connections went back to
-	// the pool, so those slots stay held.
-	require.Len(t, b.ordererState("o4").slots, len(orderers), "failed connection's slot should be released")
+	// back to full capacity. The discard sweep runs asynchronously once every
+	// leg has unwound, which may be after the fast-return above. o1-o3
+	// succeeded and their connections went back to the pool, so those slots
+	// stay held.
+	require.Eventually(t, func() bool {
+		return len(b.ordererState("o4").slots) == len(orderers)
+	}, 5*time.Second, 10*time.Millisecond, "failed connection's slot should be released")
 	for _, addr := range []string{"o1", "o2", "o3"} {
 		require.Len(t, b.ordererState(addr).slots, len(orderers)-1, "pooled connection keeps holding its slot")
 	}

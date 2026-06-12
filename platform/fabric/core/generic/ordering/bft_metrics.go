@@ -35,6 +35,20 @@ const (
 	metricGetConnection = "cbdc.ordering.bft.get_connection.duration"
 	metricSendRecv      = "cbdc.ordering.bft.send_recv.duration"
 	metricRecvOnly      = "cbdc.ordering.bft.recv_only.duration"
+	// get_connection sub-phases: which acquire stage served the request.
+	metricConnPoolHit = "cbdc.ordering.bft.conn_pool_hit.duration"
+	metricConnDial    = "cbdc.ordering.bft.conn_dial.duration"
+	metricConnWait    = "cbdc.ordering.bft.conn_wait.duration"
+	metricConnDiscard = "cbdc.ordering.bft.conn_discard.total"
+	metricPoolIdle    = "cbdc.ordering.bft.pool_idle"
+)
+
+// conn_discard reasons.
+const (
+	bftDiscardSendErr   = "send_err"
+	bftDiscardTimeout   = "timeout"
+	bftDiscardStatusErr = "status_err"
+	bftDiscardPoolFull  = "pool_full"
 )
 
 // bftPhaseBuckets cover the latency distribution observed in c=100 — c=800
@@ -51,6 +65,10 @@ var (
 	bftGetConn     metric.Float64Histogram
 	bftSendRecv    metric.Float64Histogram
 	bftRecvOnly    metric.Float64Histogram
+	bftConnPoolHit metric.Float64Histogram
+	bftConnDial    metric.Float64Histogram
+	bftConnWait    metric.Float64Histogram
+	bftConnDiscard metric.Int64Counter
 )
 
 // ensureBFTMetricsInit lazily registers BFT histograms with the OTel global
@@ -72,7 +90,50 @@ func ensureBFTMetricsInit() {
 			"Per-orderer SendAndRecv round-trip (Send + Recv wait).")
 		bftRecvOnly = newBFTHistogram(meter, metricRecvOnly,
 			"Recv-only portion of SendAndRecv (orderer ack latency).")
+		bftConnPoolHit = newBFTHistogram(meter, metricConnPoolHit,
+			"Connection served from the pool without waiting.")
+		bftConnDial = newBFTHistogram(meter, metricConnDial,
+			"New orderer connection dial (TCP+TLS handshake+stream).")
+		bftConnWait = newBFTHistogram(meter, metricConnWait,
+			"Blocking wait for a pooled connection or a free slot.")
+		if c, err := meter.Int64Counter(metricConnDiscard,
+			metric.WithDescription("Orderer connections destroyed, by reason.")); err == nil {
+			bftConnDiscard = c
+		}
 	})
+}
+
+// recordBFTDiscard counts a destroyed orderer connection with its reason.
+func recordBFTDiscard(ctx context.Context, orderer, reason string) {
+	if bftConnDiscard == nil {
+		return
+	}
+	bftConnDiscard.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("orderer", orderer),
+		attribute.String("reason", reason),
+	))
+}
+
+// registerBFTPoolGauge exports per-orderer idle pooled connections for the
+// given broadcaster. One callback per broadcaster instance; in practice a
+// process runs a single broadcaster per ordering service.
+func registerBFTPoolGauge(b *BFTBroadcaster) {
+	ensureBFTMetricsInit()
+	meter := otel.Meter(scopeOrdering)
+	gauge, err := meter.Int64ObservableGauge(metricPoolIdle,
+		metric.WithDescription("Idle pooled orderer connections."))
+	if err != nil {
+		return
+	}
+	_, _ = meter.RegisterCallback(func(_ context.Context, obs metric.Observer) error {
+		b.statesLock.RLock()
+		defer b.statesLock.RUnlock()
+		for addr, state := range b.states {
+			obs.ObserveInt64(gauge, int64(len(state.pool)),
+				metric.WithAttributes(attribute.String("orderer", addr)))
+		}
+		return nil
+	}, gauge)
 }
 
 func newBFTHistogram(meter metric.Meter, name, desc string) metric.Float64Histogram {
