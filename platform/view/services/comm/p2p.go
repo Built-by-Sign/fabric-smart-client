@@ -68,12 +68,14 @@ type P2PNode struct {
 	numWorkers                 int
 	incomingMessagesBufferSize int
 	streamReaderBufferSize     int
+	maxStreamsPerPeer          int
 }
 
 func NewNode(ctx context.Context, h host2.P2PHost, metricsProvider metrics.Provider) (*P2PNode, error) {
 	return NewNodeWithConfig(ctx, h, metricsProvider, &config{
 		incomingMessagesBufferSize: DefaultIncomingMessagesBufferSize,
 		streamReaderBufferSize:     DefaultStreamReaderBufferSize,
+		maxStreamsPerPeer:          DefaultMaxStreamsPerPeer,
 	})
 }
 
@@ -86,6 +88,9 @@ func NewNodeWithConfig(ctx context.Context, h host2.P2PHost, metricsProvider met
 	}
 	if cfg.dispatcherWorkers <= 0 {
 		cfg.dispatcherWorkers = DefaultDispatcherWorkers
+	}
+	if cfg.maxStreamsPerPeer <= 0 {
+		cfg.maxStreamsPerPeer = DefaultMaxStreamsPerPeer
 	}
 	nodeCtx, cancel := context.WithCancel(ctx)
 	p := &P2PNode{
@@ -101,6 +106,7 @@ func NewNodeWithConfig(ctx context.Context, h host2.P2PHost, metricsProvider met
 		numWorkers:                 cfg.dispatcherWorkers,
 		incomingMessagesBufferSize: cfg.incomingMessagesBufferSize,
 		streamReaderBufferSize:     cfg.streamReaderBufferSize,
+		maxStreamsPerPeer:          cfg.maxStreamsPerPeer,
 	}
 	if err := h.Start(p.handleIncomingStream); err != nil {
 		cancel()
@@ -230,12 +236,8 @@ func (p *P2PNode) dispatchMessages(ctx context.Context) {
 	}
 }
 
-// maxStreamsPerPeer bounds how many outgoing streams sendWithCachedStreams
-// fans out to per peer before falling back to a blocking send on an existing
-// stream. libp2p hashes streams by peer ID only, so without fan-out every send
-// to a peer serializes on one stream's write lock + yamux window; without a cap
-// a sustained burst against a slow peer could open unbounded streams.
-const maxStreamsPerPeer = 8
+// maxStreamsPerPeer is configurable via fsc.p2p.maxStreamsPerPeer; see
+// DefaultMaxStreamsPerPeer in config.go for the fan-out semantics and cap rationale.
 
 // registerStreamInSession leases the stream into the session so it is closed
 // with the session. No-op when session is nil.
@@ -290,7 +292,7 @@ func (p *P2PNode) sendWithCachedStreams(streamHash string, msg proto.Message, se
 	// Nothing took the message. Below the cap, ask sendTo to open a fresh
 	// stream (more parallelism). At the cap, block on a live stream so the
 	// number of open streams per peer stays bounded.
-	if live < maxStreamsPerPeer {
+	if live < p.maxStreamsPerPeer {
 		return errors.Wrapf(errStreamNotFound, "all [%d] cached streams busy/failed for hash [%s]", len(streamsCopy), streamHash)
 	}
 	for _, stream := range streamsCopy {
