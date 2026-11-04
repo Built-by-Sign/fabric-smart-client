@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap/zapcore"
@@ -72,15 +73,53 @@ type Manager struct {
 	metrics          *Metrics
 	runner           Runner
 
+	// shards holds the contexts, partitioned by context ID so that independent contexts do not
+	// contend on one lock.
+	shards [numContextShards]contextShard
+	// numContexts is the number of contexts in all shards.
+	numContexts atomic.Int64
+}
+
+// numContextShards is the number of partitions of the context store.
+const numContextShards = 256
+
+// contextShard is a partition of the context store.
+type contextShard struct {
+	mu       sync.RWMutex
 	contexts map[string]DisposableContext
 	// responders holds the responder contexts created by NewResponderContext, by context ID.
 	responders map[string]*responderContext
-	contextsMu sync.RWMutex
+}
+
+// shard returns the partition of contextID (FNV-1a).
+func (cm *Manager) shard(contextID string) *contextShard {
+	h := uint32(2166136261)
+	for i := 0; i < len(contextID); i++ {
+		h ^= uint32(contextID[i])
+		h *= 16777619
+	}
+	return &cm.shards[h%numContextShards]
+}
+
+// putContext stores c under contextID in s and updates the gauge. The caller must hold s.mu.
+func (cm *Manager) putContext(s *contextShard, contextID string, c DisposableContext) {
+	if _, ok := s.contexts[contextID]; !ok {
+		cm.metrics.Contexts.Set(float64(cm.numContexts.Add(1)))
+	}
+	s.contexts[contextID] = c
+}
+
+// removeContext deletes contextID from s and updates the gauge. The caller must hold s.mu.
+func (cm *Manager) removeContext(s *contextShard, contextID string) {
+	if _, ok := s.contexts[contextID]; ok {
+		delete(s.contexts, contextID)
+		cm.metrics.Contexts.Set(float64(cm.numContexts.Add(-1)))
+	}
 }
 
 // responderContext is a responder context shared by the responders that run in it. It is
 // disposed, and its go context cancelled, when the last of them releases it. Its fields are
-// guarded by Manager.contextsMu.
+// guarded by the lock of the shard of its context ID.
 type responderContext struct {
 	parent     ParentContext
 	cancel     context.CancelFunc
@@ -95,18 +134,21 @@ func NewManager(
 	contextFactory ContextFactory,
 	runner Runner,
 ) *Manager {
-	return &Manager{
+	m := &Manager{
 		identityProvider: identityProvider,
 
-		contexts:   map[string]DisposableContext{},
-		responders: map[string]*responderContext{},
-		registry:   registry,
+		registry: registry,
 
 		metrics:        metrics,
 		contextFactory: contextFactory,
 
 		runner: runner,
 	}
+	for i := range m.shards {
+		m.shards[i].contexts = map[string]DisposableContext{}
+		m.shards[i].responders = map[string]*responderContext{}
+	}
+	return m
 }
 
 // GetManager returns an instance of *Manager, if available, an error otherwise.
@@ -229,19 +271,20 @@ func (cm *Manager) newChildContextForInitiator(ctx context.Context, view view.Vi
 		return nil, err
 	}
 	c := NewChildContextFromParent(viewContext)
-	cm.contextsMu.Lock()
-	cm.contexts[c.ID()] = c
-	cm.metrics.Contexts.Set(float64(len(cm.contexts)))
-	cm.contextsMu.Unlock()
+	s := cm.shard(c.ID())
+	s.mu.Lock()
+	cm.putContext(s, c.ID(), c)
+	s.mu.Unlock()
 
 	return c, nil
 }
 
 // Context returns a view.Context for a given contextID. If the context does not exist, an error is returned.
 func (cm *Manager) Context(contextID string) (view.Context, error) {
-	cm.contextsMu.RLock()
-	defer cm.contextsMu.RUnlock()
-	viewCtx, ok := cm.contexts[contextID]
+	s := cm.shard(contextID)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	viewCtx, ok := s.contexts[contextID]
 	if !ok {
 		return nil, errors.Wrapf(ErrContextNotFound, "context %s not found", contextID)
 	}
@@ -251,10 +294,10 @@ func (cm *Manager) Context(contextID string) (view.Context, error) {
 // RegisterContext registers a view context.
 // It is responsibility of the caller to remove context from this manager when not needed anymore.
 func (cm *Manager) RegisterContext(contextID string, ctx DisposableContext) error {
-	cm.contextsMu.Lock()
-	defer cm.contextsMu.Unlock()
-	cm.contexts[contextID] = ctx
-	cm.metrics.Contexts.Set(float64(len(cm.contexts)))
+	s := cm.shard(contextID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cm.putContext(s, contextID, ctx)
 
 	return nil
 }
@@ -284,8 +327,9 @@ func (cm *Manager) NewResponderContext(ctx context.Context, contextID string, se
 	if ctx == nil {
 		return nil, nil, errors.New("context is nil")
 	}
-	cm.contextsMu.Lock()
-	defer cm.contextsMu.Unlock()
+	s := cm.shard(contextID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	if me.IsNone() {
 		me = cm.identityProvider.DefaultIdentity()
@@ -296,8 +340,8 @@ func (cm *Manager) NewResponderContext(ctx context.Context, contextID string, se
 		return nil, nil, errors.Wrapf(ErrInvalidSessionID, "incoming session for context [%s]", contextID)
 	}
 
-	if viewContext, ok := cm.contexts[contextID]; ok {
-		rc, ok := cm.responders[contextID]
+	if viewContext, ok := s.contexts[contextID]; ok {
+		rc, ok := s.responders[contextID]
 		if !ok {
 			return nil, nil, errors.Wrapf(ErrNotResponderContext, "context [%s]", contextID)
 		}
@@ -317,7 +361,7 @@ func (cm *Manager) NewResponderContext(ctx context.Context, contextID string, se
 		}
 		logger.DebugfContext(ctx, "[%s] Join context to respond [contextID:%s][attach:%v]", me, contextID, attach)
 		if attach {
-			cm.contexts[contextID] = NewChildContextFromParentAndSession(rc.parent, current)
+			cm.putContext(s, contextID, NewChildContextFromParentAndSession(rc.parent, current))
 		}
 		c := NewChildContextFromParentAndSession(rc.parent, current)
 		c.ctx = ctx
@@ -341,9 +385,8 @@ func (cm *Manager) NewResponderContext(ctx context.Context, contextID string, se
 	}
 
 	rc := &responderContext{parent: newCtx, cancel: cancel}
-	cm.responders[contextID] = rc
-	cm.contexts[contextID] = NewChildContextFromParent(newCtx)
-	cm.metrics.Contexts.Set(float64(len(cm.contexts)))
+	s.responders[contextID] = rc
+	cm.putContext(s, contextID, NewChildContextFromParent(newCtx))
 	c := NewChildContextFromParent(newCtx)
 	c.ctx = ctx
 
@@ -351,7 +394,7 @@ func (cm *Manager) NewResponderContext(ctx context.Context, contextID string, se
 }
 
 // acquire adds a responder to rc and returns the func that releases it, once, when called or
-// when ctx is done. The caller must hold cm.contextsMu.
+// when ctx is done. The caller must hold the lock of the shard of contextID.
 func (cm *Manager) acquire(ctx context.Context, contextID string, rc *responderContext) func() {
 	rc.responders++
 	release := sync.OnceFunc(func() { cm.release(contextID, rc) })
@@ -366,20 +409,20 @@ func (cm *Manager) acquire(ctx context.Context, contextID string, rc *responderC
 // and removed from the manager only if it is still registered under contextID: DeleteContext
 // has already disposed a context it removed, and a newer context may reuse the ID.
 func (cm *Manager) release(contextID string, rc *responderContext) {
-	cm.contextsMu.Lock()
-	defer cm.contextsMu.Unlock()
+	s := cm.shard(contextID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	rc.responders--
 	if rc.responders > 0 {
 		return
 	}
 	defer rc.cancel()
-	if cm.responders[contextID] == rc {
+	if s.responders[contextID] == rc {
 		logger.Debugf("last responder returned, dispose context [%s]", contextID)
 		rc.parent.Dispose()
-		delete(cm.responders, contextID)
-		delete(cm.contexts, contextID)
-		cm.metrics.Contexts.Set(float64(len(cm.contexts)))
+		delete(s.responders, contextID)
+		cm.removeContext(s, contextID)
 	}
 }
 
@@ -397,18 +440,18 @@ func (cm *Manager) ExistResponderForCaller(caller string) (view.View, view.Ident
 // context is disposed immediately, including the sessions of responders still running in it;
 // responders release their context with the func returned by NewResponderContext instead.
 func (cm *Manager) DeleteContext(contextID string) {
-	cm.contextsMu.Lock()
-	defer cm.contextsMu.Unlock()
+	s := cm.shard(contextID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	delete(cm.responders, contextID)
+	delete(s.responders, contextID)
 
 	logger.Debugf("deleting context [%s]", contextID)
 	// dispose context
-	if viewCtx, ok := cm.contexts[contextID]; ok {
+	if viewCtx, ok := s.contexts[contextID]; ok {
 		logger.Debugf("found, dispose context [%s]", contextID)
 		viewCtx.Dispose()
-		delete(cm.contexts, contextID)
-		cm.metrics.Contexts.Set(float64(len(cm.contexts)))
+		cm.removeContext(s, contextID)
 	}
 }
 
