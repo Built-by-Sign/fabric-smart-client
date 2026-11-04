@@ -58,12 +58,12 @@ func (n *NetworkService) Channel(id string) (*Channel, error) {
 		return nil, err
 	}
 	c, ok = n.channels[ch.Name()]
-	if ok {
-		return c, nil
+	if !ok {
+		c = NewChannel(n.subscriber, n.fns, ch)
+		n.channels[ch.Name()] = c
 	}
-
-	c = NewChannel(n.subscriber, n.fns, ch)
-	n.channels[ch.Name()] = c
+	// also key by the requested id (e.g. "" for the default channel) so the read path hits
+	n.channels[id] = c
 
 	return c, nil
 }

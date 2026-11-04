@@ -55,6 +55,32 @@ func TestNetworkService(t *testing.T) {
 	require.NotNil(t, ns.ConfigService())
 }
 
+func TestNetworkServiceDefaultChannelCached(t *testing.T) {
+	t.Parallel()
+
+	mfns := &mock.FabricNetworkService{}
+	ns := NewNetworkService(nil, mfns, "mynetwork")
+	mch := &mock.Channel{}
+	mch.NameReturns("mychannel")
+	mfns.ChannelReturns(mch, nil)
+
+	// the empty id resolves to the default channel, named differently from the id
+	ch, err := ns.Channel("")
+	require.NoError(t, err)
+	require.Equal(t, "mychannel", ch.Name())
+
+	ch2, err := ns.Channel("")
+	require.NoError(t, err)
+	require.Same(t, ch, ch2)
+	require.Equal(t, 1, mfns.ChannelCallCount())
+
+	// the resolved name shares the same cached instance
+	ch3, err := ns.Channel("mychannel")
+	require.NoError(t, err)
+	require.Same(t, ch, ch3)
+	require.Equal(t, 1, mfns.ChannelCallCount())
+}
+
 func TestNetworkServiceProvider(t *testing.T) {
 	t.Parallel()
 
