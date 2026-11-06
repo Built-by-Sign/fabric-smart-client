@@ -9,6 +9,7 @@ package vault_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/hyperledger/fabric-x-common/api/applicationpb"
 	"github.com/stretchr/testify/require"
@@ -98,36 +99,41 @@ func TestRWSet_UnknownNamespaceSerializesVersionZero(t *testing.T) {
 	require.Equal(t, uint64(0), nsVersionOf(t, raw, "ns1"))
 }
 
-// Namespace versions are resolved per RWSet, exactly like the key read versions GetState
-// captures: nothing is cached across transactions, so each RWSet sees the version current
-// when it touched the namespace, and a later transaction picks up an updated one.
-func TestVault_NamespaceVersionResolvedPerRWSet(t *testing.T) {
+// Namespace versions are cached for a short TTL across RWSets: a transaction that starts
+// within the TTL reuses the cached version, and one that starts after it expires picks up an
+// updated version. A version pinned stale is caught by the committer as a _meta conflict.
+func TestVault_NamespaceVersionCachedForTTL(t *testing.T) {
 	t.Parallel()
 	qs := newMockQueryService()
 	qs.setState("_meta", "ns1", nil, 7)
 	v := vault.NewVault(qs, nil)
+	vault.SetNamespaceVersionTTL(v, 50*time.Millisecond)
 	ctx := context.Background()
 
 	first, err := v.NewRWSet(ctx, "tx1")
 	require.NoError(t, err)
 	require.NoError(t, first.SetState("ns1", "key1", []byte("val1")))
 
-	// A namespace policy update lands between the two transactions.
+	// A namespace policy update lands between the transactions.
 	qs.setState("_meta", "ns1", nil, 9)
 
-	second, err := v.NewRWSet(ctx, "tx2")
+	withinTTL, err := v.NewRWSet(ctx, "tx2")
 	require.NoError(t, err)
-	require.NoError(t, second.SetState("ns1", "key1", []byte("val1")))
+	require.NoError(t, withinTTL.SetState("ns1", "key1", []byte("val1")))
 
-	firstRaw, err := first.Bytes()
+	time.Sleep(60 * time.Millisecond)
+	afterTTL, err := v.NewRWSet(ctx, "tx3")
 	require.NoError(t, err)
-	secondRaw, err := second.Bytes()
-	require.NoError(t, err)
+	require.NoError(t, afterTTL.SetState("ns1", "key1", []byte("val1")))
 
-	require.Equal(t, uint64(7), nsVersionOf(t, firstRaw, "ns1"),
-		"the in-flight RWSet keeps the version it simulated against")
-	require.Equal(t, uint64(9), nsVersionOf(t, secondRaw, "ns1"),
-		"a new RWSet must pick up the updated version without a restart")
+	for name, want := range map[string]struct {
+		rws interface{ Bytes() ([]byte, error) }
+		v   uint64
+	}{"first": {first, 7}, "withinTTL": {withinTTL, 7}, "afterTTL": {afterTTL, 9}} {
+		raw, err := want.rws.Bytes()
+		require.NoError(t, err)
+		require.Equal(t, want.v, nsVersionOf(t, raw, "ns1"), name)
+	}
 }
 
 // Touching the same namespace repeatedly resolves its version once; only the first touch
@@ -213,6 +219,7 @@ func TestRWSet_AppendDoesNotOverwriteAnEarlierPin(t *testing.T) {
 	qs := newMockQueryService()
 	qs.setState("_meta", "ns1", nil, 7)
 	v := vault.NewVault(qs, nil)
+	vault.SetNamespaceVersionTTL(v, 0) // updates _meta between RWSets
 	ctx := context.Background()
 
 	source, err := v.NewRWSet(ctx, "tx1")
@@ -359,6 +366,7 @@ func TestRWSet_ClearedNamespaceIsRepinned(t *testing.T) {
 	qs := newMockQueryService()
 	qs.setState("_meta", "ns1", nil, 7)
 	v := vault.NewVault(qs, nil)
+	vault.SetNamespaceVersionTTL(v, 0) // updates _meta between RWSets
 
 	rws, err := v.NewRWSet(context.Background(), "tx1")
 	require.NoError(t, err)

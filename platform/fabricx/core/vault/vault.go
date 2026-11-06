@@ -13,9 +13,11 @@ import (
 	"maps"
 	"slices"
 	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/hyperledger/fabric-x-common/api/committerpb"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/hyperledger-labs/fabric-smart-client/pkg/utils/errors"
 	"github.com/hyperledger-labs/fabric-smart-client/platform/common/core/generic/vault"
@@ -26,6 +28,10 @@ import (
 
 const (
 	metaNamespace = "_meta"
+	// defaultNamespaceVersionTTL bounds how long a _meta version is reused across RWSets.
+	// ponytail: a stale pin after a policy update fails at commit as a _meta conflict for up to
+	// this long; push the update through invalidation if that window ever matters.
+	defaultNamespaceVersionTTL = time.Second
 )
 
 // Vault implements the fdriver.Vault interface for FabricX. Several interface methods
@@ -36,6 +42,16 @@ type Vault struct {
 	queryService queryservice.QueryService // Remote query service for state and status queries
 	mds          fdriver.MetadataService   // Field-mapping (hash-hiding) metadata store
 	marshaller   *Marshaller               // Marshaller for RWSet serialization
+
+	nsVersionTTL time.Duration      // How long a resolved _meta version is reused
+	nsFlight     singleflight.Group // Collapses concurrent _meta lookups per namespace
+	nsMu         sync.Mutex         // Guards nsVersions
+	nsVersions   map[cdriver.Namespace]nsVersionEntry
+}
+
+type nsVersionEntry struct {
+	version    cdriver.RawVersion
+	resolvedAt time.Time
 }
 
 // NewVault creates a new Vault instance with the given QueryService and MetadataService.
@@ -53,6 +69,8 @@ func NewVault(qs queryservice.QueryService, mds fdriver.MetadataService) *Vault 
 		queryService: qs,
 		mds:          mds,
 		marshaller:   NewMarshaller(),
+		nsVersionTTL: defaultNamespaceVersionTTL,
+		nsVersions:   map[cdriver.Namespace]nsVersionEntry{},
 	}
 }
 
@@ -262,6 +280,32 @@ func (r *rwSetWrapper) IsValid() error {
 // _meta entry is reported as version 0, matching how an unregistered namespace has always
 // been serialized.
 func (v *Vault) namespaceVersion(ns cdriver.Namespace) (cdriver.RawVersion, error) {
+	v.nsMu.Lock()
+	e, ok := v.nsVersions[ns]
+	v.nsMu.Unlock()
+	if ok && time.Since(e.resolvedAt) < v.nsVersionTTL {
+		return slices.Clone(e.version), nil
+	}
+	res, err, _ := v.nsFlight.Do(ns, func() (any, error) {
+		version, err := v.fetchNamespaceVersion(ns)
+		if err != nil {
+			return nil, err
+		}
+		v.nsMu.Lock()
+		if v.nsVersions == nil {
+			v.nsVersions = map[cdriver.Namespace]nsVersionEntry{}
+		}
+		v.nsVersions[ns] = nsVersionEntry{version: version, resolvedAt: time.Now()}
+		v.nsMu.Unlock()
+		return version, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return slices.Clone(res.(cdriver.RawVersion)), nil
+}
+
+func (v *Vault) fetchNamespaceVersion(ns cdriver.Namespace) (cdriver.RawVersion, error) {
 	states, err := v.queryService.GetStates(map[cdriver.Namespace][]cdriver.PKey{
 		metaNamespace: {ns},
 	})
