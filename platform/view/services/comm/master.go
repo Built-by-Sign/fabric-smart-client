@@ -150,12 +150,16 @@ func (p *P2PNode) unregister(session *NetworkStreamSession, selfClosed bool) {
 	if !selfClosed {
 		return
 	}
-	// ponytail: scans every remembered key per self-close; use a time-ordered queue if many sessions self-close at once.
+	// Prune at most once per TTL: lookups check the age themselves, so an expired key left in
+	// place is harmless, and the map stays bounded by two TTLs of self-closes.
 	now := time.Now()
-	for k, closedAt := range p.selfClosed {
-		if now.Sub(closedAt) >= closedSessionTTL {
-			delete(p.selfClosed, k)
+	if now.Sub(p.selfClosedSweptAt) >= closedSessionTTL {
+		for k, closedAt := range p.selfClosed {
+			if now.Sub(closedAt) >= closedSessionTTL {
+				delete(p.selfClosed, k)
+			}
 		}
+		p.selfClosedSweptAt = now
 	}
 	p.selfClosed[key] = now
 }

@@ -63,7 +63,9 @@ type P2PNode struct {
 	sessions         map[string]*NetworkStreamSession
 	// selfClosed maps the registry key of each session that closed on its own to when it closed,
 	// see closedSessionTTL. Guarded by sessionsMutex.
-	selfClosed                 map[string]time.Time
+	selfClosed map[string]time.Time
+	// selfClosedSweptAt is when expired selfClosed keys were last pruned. Guarded by sessionsMutex.
+	selfClosedSweptAt          time.Time
 	finderWg                   sync.WaitGroup
 	handlersWg                 sync.WaitGroup
 	dispatchWg                 sync.WaitGroup
